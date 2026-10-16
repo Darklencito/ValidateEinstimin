@@ -20,5 +20,12 @@ export async function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/dashboard/:path*", "/api/validate-csv", "/api/smtp-batch", "/api/smtp-check"],
+  matcher: [
+    "/dashboard/:path*",
+    "/api/validate-csv",
+    "/api/smtp-batch",
+    "/api/smtp-check",
+    "/api/ea-batch",
+    "/api/ea-status",
+  ],
 };

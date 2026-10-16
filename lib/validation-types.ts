@@ -32,9 +32,9 @@ export interface EmailResult {
   email: string;
   status: EmailStatus;
   reason: string;
-  /** Capa en la que se decidió: 1 local, 2 DNS/MX, 3 SMTP */
-  layer?: 1 | 2 | 3;
-  /** true si el servidor SMTP dio una respuesta concluyente sobre este correo */
+  /** Capa en la que se decidió: 1 local, 2 DNS/MX, 3 SMTP, 4 EmailAwesome */
+  layer?: 1 | 2 | 3 | 4;
+  /** true si SMTP o EmailAwesome dieron una respuesta concluyente sobre este correo */
   confirmed?: boolean;
   /** Celda original del CSV (solo si traía varios correos) */
   source?: string;
@@ -67,3 +67,17 @@ export interface SmtpBatchResponse {
   via: string;
 }
 
+
+/** Respuesta de /api/ea-batch (capa 4: EmailAwesome) */
+export interface EaBatchResponse {
+  items: {
+    email: string;
+    id?: string;
+    state: "done" | "pending" | "error";
+    status?: EmailStatus;
+    reason?: string;
+    confirmed?: boolean;
+    error?: string;
+  }[];
+  fatal?: string;
+}

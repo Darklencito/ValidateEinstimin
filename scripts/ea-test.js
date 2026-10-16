@@ -10,9 +10,16 @@
 //
 // Gasta 1 crédito (una sola validación). Los GET no consumen.
 
+// Carga .env.local si existe (Node 20.12+). Solo rellena variables que aún no estén definidas.
+try {
+  process.loadEnvFile(".env.local");
+} catch {
+  /* sin .env.local: se usa la variable de entorno del sistema */
+}
+
 const key = process.env.EMAILAWESOME_API_KEY;
 if (!key) {
-  console.error("Falta la variable EMAILAWESOME_API_KEY");
+  console.error("Falta la variable EMAILAWESOME_API_KEY (ni en el entorno ni en .env.local)");
   process.exit(1);
 }
 const email = process.env.EA_TEST_EMAIL || "john.smith@test.com";

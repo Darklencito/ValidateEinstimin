@@ -138,6 +138,15 @@ Para mejores resultados con Yahoo y Outlook, configura en el panel del VPS el **
 - **Yahoo y Outlook** suelen bloquear o no revelar buzones; esos correos quedarán «no concluyentes» y pasan al CSV limpio salvo que marques el modo estricto.
 - Una lista de varios miles puede tardar **horas**. Empieza con una muestra pequeña.
 
+## Capa 4: EmailAwesome (opcional)
+
+Servicio externo de verificación de buzones que usa créditos de tu plan. Se usa **solo para los correos que ninguna capa anterior pudo confirmar**, y nunca se envía nada sin que lo confirmes en pantalla.
+
+- Variable: `EMAILAWESOME_API_KEY` (en `.env.local` y en las variables de entorno de SiteGround). Nunca en el código ni en GitHub.
+- Flujo de su API: se crea la validación (POST) y se consulta por `id` hasta que termine (unos 15 s). No usa callback.
+- Los lotes son de 20 correos. Las validaciones que no terminan a tiempo se reanudan con su `id` sin volver a cobrarse.
+- Los resultados «Unknown» no se cobran. Si falla la clave, no hay créditos o hay límite de velocidad, el proceso se detiene con un aviso y se conserva lo ya verificado.
+- Scripts de diagnóstico: `node scripts/ea-test.js` (crea 1 validación, gasta 1 crédito) y `node scripts/ea-poll.js` (consulta una existente, no gasta).
 ## Estructura
 
 ```

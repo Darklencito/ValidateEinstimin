@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { CheckCircle2, Layers, Loader2, X } from "lucide-react";
 import { Button } from "@/components/ui/Button";
@@ -7,14 +7,14 @@ import { STATUS_LABEL, type EmailResult, type EmailStatus } from "@/lib/validati
 export interface LiveProgress {
   done: number;
   total: number;
-  /** Fase actual: capas 1-2 (rápida) o capa 3 (SMTP por lotes) */
-  phase: "layers12" | "smtp";
-  /** Mensaje de estado, p. ej. "Lote 3 de 20 · pausa de 10 s" */
+  /** Fase actual: capas 1-2 (rÃ¡pida) o capa 3 (SMTP por lotes) */
+  phase: "layers12" | "smtp" | "ea";
+  /** Mensaje de estado, p. ej. "Lote 3 de 20 Â· pausa de 10 s" */
   statusText?: string;
-  /** Últimos correos procesados (el más reciente primero) */
+  /** Ãšltimos correos procesados (el mÃ¡s reciente primero) */
   recent: EmailResult[];
-  /** Cuántos correos se resolvieron en cada capa [1, 2, 3] */
-  layerCounts: [number, number, number];
+  /** CuÃ¡ntos correos se resolvieron en cada capa [1, 2, 3] */
+  layerCounts: [number, number, number, number];
   valid: number;
   invalid: number;
   risky: number;
@@ -42,11 +42,15 @@ export function ValidationProgressModal({
   const finished = total > 0 && done >= total;
 
   const layers = [
-    { n: 1, name: "Sintaxis y listas", hint: "Formato, desechables, tipeo, exclusión", active: true },
-    { n: 2, name: "Dominio (MX)", hint: "Registros DNS y cuentas genéricas", active: true },
+    { n: 1, name: "Sintaxis y listas", hint: "Formato, desechables, tipeo, exclusiÃ³n", active: true },
+    { n: 2, name: "Dominio (MX)", hint: "Registros DNS y cuentas genÃ©ricas", active: true },
     {
-      n: 3, name: "Buzón (SMTP)", active: phase === "smtp",
-      hint: phase === "smtp" ? "Consulta al servidor de correo, por lotes" : "Se ejecuta después, si la activaste",
+      n: 3, name: "BuzÃ³n (SMTP)", active: phase === "smtp",
+      hint: phase === "smtp" ? "Consulta al servidor de correo, por lotes" : "Opcional, por lotes",
+    },
+    {
+      n: 4, name: "EmailAwesome", active: phase === "ea",
+      hint: phase === "ea" ? "VerificaciÃ³n externa por API" : "Opcional, con crÃ©ditos",
     },
   ];
 
@@ -55,7 +59,7 @@ export function ValidationProgressModal({
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
       role="dialog"
       aria-modal="true"
-      aria-label="Progreso de validación"
+      aria-label="Progreso de validaciÃ³n"
     >
       <div className="flex max-h-[90vh] w-full max-w-2xl flex-col gap-4 overflow-hidden rounded-xl bg-white p-5 shadow-xl">
         <div className="flex items-start justify-between gap-3">
@@ -70,14 +74,16 @@ export function ValidationProgressModal({
                 ? "Finalizando..."
                 : progress.phase === "smtp"
                   ? "Verificando buzones por SMTP (capa 3)"
-                  : "Validando correos (capas 1 y 2)"}
+                  : progress.phase === "ea"
+                    ? "Verificando con EmailAwesome (capa 4)"
+                    : "Validando correos (capas 1 y 2)"}
             </h2>
             <p className="truncate text-sm text-slate-500">{fileName}</p>
           </div>
           <button
             onClick={onCancel}
             className="rounded-lg p-1 text-slate-500 hover:bg-slate-100"
-            aria-label="Cancelar validación"
+            aria-label="Cancelar validaciÃ³n"
           >
             <X size={20} />
           </button>
@@ -111,10 +117,10 @@ export function ValidationProgressModal({
         {/* Contadores */}
         <div className="grid grid-cols-3 gap-2 text-center text-sm">
           <div className="rounded-lg bg-green-50 p-2 text-green-700">
-            <p className="text-lg font-semibold">{progress.valid}</p>Válidos
+            <p className="text-lg font-semibold">{progress.valid}</p>VÃ¡lidos
           </div>
           <div className="rounded-lg bg-red-50 p-2 text-red-700">
-            <p className="text-lg font-semibold">{progress.invalid}</p>Inválidos
+            <p className="text-lg font-semibold">{progress.invalid}</p>InvÃ¡lidos
           </div>
           <div className="rounded-lg bg-amber-50 p-2 text-amber-700">
             <p className="text-lg font-semibold">{progress.risky}</p>Riesgo
@@ -122,7 +128,7 @@ export function ValidationProgressModal({
         </div>
 
         {/* Las 3 capas */}
-        <div className="grid gap-2 sm:grid-cols-3">
+        <div className="grid gap-2 sm:grid-cols-2">
           {layers.map((l) => (
             <div
               key={l.n}

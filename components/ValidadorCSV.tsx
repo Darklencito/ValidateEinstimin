@@ -1,6 +1,6 @@
 "use client";
 
-import { DragEvent, useMemo, useRef, useState } from "react";
+import { DragEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle, CheckCircle2, Download, FileUp, Info, Loader2, Play, RefreshCw,
   ShieldAlert, Wifi, XCircle,
@@ -9,7 +9,7 @@ import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { downloadCsv, toCsv } from "@/lib/csv";
 import {
-  STATUS_LABEL, emptySummary, type EmailResult, type EmailStatus, type SmtpBatchResponse,
+  STATUS_LABEL, emptySummary, type EaBatchResponse, type EmailResult, type EmailStatus, type SmtpBatchResponse,
   type StreamEvent, type ValidationResponse,
 } from "@/lib/validation-types";
 import { ValidationProgressModal, type LiveProgress } from "@/components/ValidationProgressModal";
@@ -84,6 +84,16 @@ export default function ValidadorCSV() {
   const [onePerCell, setOnePerCell] = useState(true);
   const [strictSmtp, setStrictSmtp] = useState(false);
 
+  // Capa 4: verificación externa con EmailAwesome (opcional, usa créditos)
+  const [eaConfigured, setEaConfigured] = useState<boolean | null>(null);
+  const [eaMax, setEaMax] = useState(500);
+  useEffect(() => {
+    fetch("/api/ea-status")
+      .then((r) => r.json())
+      .then((j) => setEaConfigured(!!j.configured))
+      .catch(() => setEaConfigured(false));
+  }, []);
+
   // ---------- Prueba de conexión al puerto 25 ----------
   async function testConnection() {
     setChecking(true);
@@ -118,7 +128,7 @@ export default function ValidadorCSV() {
     let pause = basePause;
     const batches = Math.ceil(candidates.length / size);
     const recent: EmailResult[] = [];
-    const layerCounts: [number, number, number] = [0, 0, 0];
+    const layerCounts: [number, number, number, number] = [0, 0, 0, 0];
     let done = 0;
     let stopReason = "";
 
@@ -199,6 +209,140 @@ export default function ValidadorCSV() {
     });
   }
 
+  // ---------- Capa 4: EmailAwesome (API externa, usa créditos) ----------
+  /**
+   * Envía a EmailAwesome los correos que siguen sin confirmar (hasta `maxSend`), en lotes pequeños.
+   * Las validaciones que no terminan a tiempo se reanudan con su id, sin volver a cobrarse.
+   */
+  async function runEa(base: ValidationResponse, controller: AbortController, maxSend: number) {
+    const results = base.results.map((r) => ({ ...r }));
+    const index = new Map<string, number>();
+    results.forEach((r, i) => index.set(r.email.toLowerCase(), i));
+
+    const candidates = pickOnePerCell(results, onePerCell)
+      .filter((r) => r.status === "valid" && !r.confirmed)
+      .map((r) => r.email)
+      .slice(0, Math.max(maxSend, 0));
+
+    const SIZE = 20;
+    const recent: EmailResult[] = [];
+    const layerCounts: [number, number, number, number] = [0, 0, 0, 0];
+    const pendingIds = new Map<string, string>(); // correo -> id de validación sin terminar
+    let done = 0;
+    let stopReason = "";
+
+    const show = (statusText: string) =>
+      setProgress({
+        done, total: candidates.length, phase: "ea", statusText,
+        recent: recent.slice(0, 40), layerCounts: [...layerCounts],
+        ...tally(pickOnePerCell(results, onePerCell)),
+      });
+
+    /** Envía un lote (nuevos y/o reanudados) y aplica lo que haya terminado. Devuelve false si hay que parar. */
+    async function send(emails: string[], resume: { email: string; id: string }[]): Promise<boolean> {
+      let res: EaBatchResponse;
+      try {
+        const r = await fetch("/api/ea-batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ emails, resume }),
+          signal: controller.signal,
+        });
+        if (r.status === 401) {
+          window.location.href = "/login";
+          return false;
+        }
+        const json = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          stopReason = json.error ?? "Error del servidor al consultar EmailAwesome.";
+          return false;
+        }
+        res = json as EaBatchResponse;
+      } catch (e) {
+        if (!isAbort(e)) stopReason = "Se perdió la conexión con el servidor durante la verificación con EmailAwesome.";
+        return false;
+      }
+
+      for (const it of res.items) {
+        const i = index.get(it.email.toLowerCase());
+        if (it.state === "done" && it.status && i !== undefined) {
+          results[i] = { ...results[i], status: it.status, reason: it.reason ?? "", confirmed: !!it.confirmed, layer: 4 };
+          pendingIds.delete(it.email);
+          recent.unshift(results[i]);
+          layerCounts[3]++;
+          done++;
+        } else if (it.id) {
+          pendingIds.set(it.email, it.id); // creada pero sin terminar: se reanuda después
+        }
+      }
+      if (recent.length > 40) recent.length = 40;
+      if (res.fatal) {
+        stopReason = res.fatal;
+        return false;
+      }
+      return true;
+    }
+
+    show("Enviando correos a EmailAwesome...");
+    for (let b = 0; b * SIZE < candidates.length && !controller.signal.aborted; b++) {
+      const slice = candidates.slice(b * SIZE, (b + 1) * SIZE);
+      show(`Lote ${b + 1} de ${Math.ceil(candidates.length / SIZE)} · esperando respuesta de ${slice.length} correos (≈15 s)...`);
+      if (!(await send(slice, []))) break;
+      show(`Lote ${b + 1} de ${Math.ceil(candidates.length / SIZE)} listo`);
+    }
+
+    // Reanudar (hasta 3 rondas) las validaciones que no terminaron a tiempo
+    for (let round = 1; round <= 3 && pendingIds.size > 0 && !stopReason && !controller.signal.aborted; round++) {
+      const list = [...pendingIds.entries()].map(([email, id]) => ({ email, id }));
+      for (let k = 0; k < list.length && !controller.signal.aborted; k += SIZE) {
+        show(`Reanudando ${list.length} validaciones pendientes (ronda ${round})...`);
+        if (!(await send([], list.slice(k, k + SIZE)))) break;
+      }
+    }
+
+    if (controller.signal.aborted && !stopReason) {
+      stopReason = "Verificación con EmailAwesome detenida. Lo ya verificado se conserva.";
+    }
+    const unfinished = pendingIds.size;
+    const summary = emptySummary();
+    results.forEach((r) => summary[r.status]++);
+    setData({
+      ...base, results, summary,
+      notice:
+        stopReason ||
+        (unfinished > 0
+          ? `${unfinished} validaciones de EmailAwesome no terminaron a tiempo; siguen como «no concluyentes».`
+          : candidates.length === 0
+            ? "No había correos sin confirmar para enviar a EmailAwesome."
+            : undefined),
+    });
+  }
+
+  /** Lanza la capa 4 sobre los resultados actuales, tras confirmar el gasto de créditos. */
+  async function startEa() {
+    if (!data) return;
+    const n = Math.min(view.unconfirmed, Math.max(eaMax, 0));
+    if (n <= 0) return;
+    const ok = window.confirm(
+      `Se enviarán ${n} correos a EmailAwesome.\n\n` +
+        `Esto consume hasta ${n} créditos de tu plan (los resultados «Unknown» no se cobran).\n\n¿Continuar?`
+    );
+    if (!ok) return;
+    setError("");
+    setLoading(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      await runEa(data, controller, n);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Error durante la verificación con EmailAwesome");
+    } finally {
+      abortRef.current = null;
+      setProgress(null);
+      setLoading(false);
+    }
+  }
+
   // ---------- Capas 1 y 2 (stream) y, si se pidió, capa 3 ----------
   async function handleFile(file: File) {
     setError("");
@@ -212,7 +356,7 @@ export default function ValidadorCSV() {
     const controller = new AbortController();
     abortRef.current = controller;
     setProgress({
-      done: 0, total: 0, phase: "layers12", recent: [], layerCounts: [0, 0, 0],
+      done: 0, total: 0, phase: "layers12", recent: [], layerCounts: [0, 0, 0, 0],
       valid: 0, invalid: 0, risky: 0,
     });
 
@@ -235,7 +379,7 @@ export default function ValidadorCSV() {
       const decoder = new TextDecoder();
       const all: EmailResult[] = [];
       const recent: EmailResult[] = [];
-      const layerCounts: [number, number, number] = [0, 0, 0];
+      const layerCounts: [number, number, number, number] = [0, 0, 0, 0];
       let total = 0, done = 0, valid = 0, invalid = 0, risky = 0;
       let meta: StreamMeta | null = null;
       let buffer = "";
@@ -327,7 +471,7 @@ export default function ValidadorCSV() {
 
   // ---------- Resultados que se muestran y descargan ----------
   const view = useMemo(() => {
-    if (!data) return { results: [] as EmailResult[], summary: emptySummary(), total: 0, discarded: 0, pending: 0, inconclusive: 0, hasSmtp: false };
+    if (!data) return { results: [] as EmailResult[], summary: emptySummary(), total: 0, discarded: 0, pending: 0, inconclusive: 0, unconfirmed: 0, hasSmtp: false };
     const results = pickOnePerCell(data.results, onePerCell);
     const summary = emptySummary();
     results.forEach((r) => summary[r.status]++);
@@ -335,6 +479,7 @@ export default function ValidadorCSV() {
       results, summary, total: results.length, discarded: data.results.length - results.length,
       pending: results.filter((r) => r.status === "valid" && r.layer === 2).length,
       inconclusive: results.filter((r) => r.status === "valid" && r.layer === 3 && !r.confirmed).length,
+      unconfirmed: results.filter((r) => r.status === "valid" && !r.confirmed).length,
       hasSmtp: results.some((r) => r.layer === 3),
     };
   }, [data, onePerCell]);
@@ -565,6 +710,43 @@ export default function ValidadorCSV() {
             </Card>
           ) : null}
 
+          {/* Capa 4: EmailAwesome (opcional, usa créditos) */}
+          {view.unconfirmed > 0 && (
+            <Card className="space-y-3 border-slate-200 text-sm">
+              <div>
+                <p className="font-medium">Capa 4: verificación externa con EmailAwesome (opcional)</p>
+                <p className="text-slate-500">
+                  Hay <strong>{view.unconfirmed.toLocaleString()}</strong> correos válidos que ningún servidor confirmó
+                  (no concluyentes o sin SMTP). EmailAwesome puede confirmarlos. Cada correo consume 1 crédito de tu
+                  plan; los resultados «Unknown» no se cobran. Nunca se envía nada sin que lo confirmes.
+                </p>
+              </div>
+              {eaConfigured === false ? (
+                <p className="rounded-lg bg-amber-50 p-2 text-amber-800">
+                  Falta la variable de entorno <code>EMAILAWESOME_API_KEY</code> en el servidor.
+                </p>
+              ) : (
+                <div className="flex flex-wrap items-end gap-3">
+                  <label className="text-xs text-slate-600">
+                    Máximo de correos a enviar
+                    <input
+                      type="number"
+                      min={1}
+                      max={view.unconfirmed}
+                      value={eaMax}
+                      onChange={(e) => setEaMax(Number(e.target.value))}
+                      disabled={loading}
+                      className="mt-1 block w-32 rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm"
+                    />
+                  </label>
+                  <Button onClick={startEa} disabled={loading || eaConfigured === null}>
+                    <Play size={16} /> Verificar {Math.min(view.unconfirmed, Math.max(eaMax, 0)).toLocaleString()} con EmailAwesome
+                  </Button>
+                </div>
+              )}
+            </Card>
+          )}
+
           {!view.hasSmtp && view.pending > 0 && (
             <div className="flex items-start gap-2 rounded-lg bg-slate-100 p-3 text-sm text-slate-700">
               <Info size={16} className="mt-0.5 shrink-0" />
@@ -622,7 +804,7 @@ export default function ValidadorCSV() {
                   className="mt-0.5"
                 />
                 <span>
-                  <strong>CSV limpio estricto: solo buzones confirmados por SMTP</strong>
+                  <strong>CSV limpio estricto: solo buzones confirmados (SMTP o EmailAwesome)</strong>
                   <span className="block text-slate-500">
                     Si lo desmarcas, el CSV limpio también incluye los válidos «no concluyentes» (pasaron las
                     capas 1 y 2 pero el servidor no confirmó el buzón).
@@ -659,7 +841,7 @@ export default function ValidadorCSV() {
                         </span>
                         {r.confirmed && (
                           <span className="ml-1 rounded-full bg-indigo-100 px-2 py-0.5 text-xs font-medium text-indigo-700">
-                            SMTP ✓
+                            {r.layer === 4 ? "EmailAwesome ✓" : "SMTP ✓"}
                           </span>
                         )}
                       </td>
