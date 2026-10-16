@@ -9,9 +9,9 @@ import type { EmailStatus } from "./validation-types";
 //   3) email_address_status: VALID | INVALID | CATCH_ALL | UNKNOWN
 // Los resultados UNKNOWN no se cobran. La clave va solo en EMAILAWESOME_API_KEY.
 
-// EMAILAWESOME_BASE_URL permite apuntar a un servidor de pruebas; por defecto, la API real.
-const base = () =>
-  process.env.EMAILAWESOME_BASE_URL || "https://api.emailawesome.com/api/validations/email_validation";
+// EMAILAWESOME_API_ROOT permite apuntar a un servidor de pruebas; por defecto, la API real.
+const root = () => (process.env.EMAILAWESOME_API_ROOT || "https://api.emailawesome.com/api").replace(/\/+$/, "");
+const base = () => `${root()}/validations/email_validation`;
 const apiKey = () => process.env.EMAILAWESOME_API_KEY || "";
 
 export const eaConfigured = () => apiKey().length > 0;
@@ -38,6 +38,19 @@ async function ea(url: string, init: RequestInit = {}) {
     return JSON.parse(text);
   } catch {
     throw new EaError(res.status, "Respuesta no válida de EmailAwesome");
+  }
+}
+
+/**
+ * Saldo de créditos (GET /billing/me -> {balance}). Devuelve null si no se pudo obtener:
+ * es solo informativo y nunca debe bloquear el resto de la app.
+ */
+export async function getBalance(): Promise<number | null> {
+  try {
+    const j = (await ea(`${root()}/billing/me`)) as { balance?: unknown };
+    return typeof j.balance === "number" && Number.isFinite(j.balance) ? j.balance : null;
+  } catch {
+    return null;
   }
 }
 

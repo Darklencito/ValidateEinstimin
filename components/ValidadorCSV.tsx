@@ -87,11 +87,18 @@ export default function ValidadorCSV() {
   // Capa 4: verificación externa con EmailAwesome (opcional, usa créditos)
   const [eaConfigured, setEaConfigured] = useState<boolean | null>(null);
   const [eaMax, setEaMax] = useState(500);
-  useEffect(() => {
+  const [eaBalance, setEaBalance] = useState<number | null>(null);
+  /** Consulta si hay clave configurada y cuántos créditos quedan. */
+  const refreshEa = () =>
     fetch("/api/ea-status")
       .then((r) => r.json())
-      .then((j) => setEaConfigured(!!j.configured))
+      .then((j) => {
+        setEaConfigured(!!j.configured);
+        setEaBalance(typeof j.balance === "number" ? j.balance : null);
+      })
       .catch(() => setEaConfigured(false));
+  useEffect(() => {
+    refreshEa();
   }, []);
 
   // ---------- Prueba de conexión al puerto 25 ----------
@@ -321,11 +328,13 @@ export default function ValidadorCSV() {
   /** Lanza la capa 4 sobre los resultados actuales, tras confirmar el gasto de créditos. */
   async function startEa() {
     if (!data) return;
-    const n = Math.min(view.unconfirmed, Math.max(eaMax, 0));
+    const n = eaN; // ya limitado por el máximo elegido y por el saldo disponible
     if (n <= 0) return;
     const ok = window.confirm(
       `Se enviarán ${n} correos a EmailAwesome.\n\n` +
-        `Esto consume hasta ${n} créditos de tu plan (los resultados «Unknown» no se cobran).\n\n¿Continuar?`
+        `Esto consume hasta ${n} créditos de tu plan (los resultados «Unknown» no se cobran).` +
+        (eaBalance !== null ? `\nCréditos disponibles ahora: ${eaBalance}.` : "") +
+        `\n\n¿Continuar?`
     );
     if (!ok) return;
     setError("");
@@ -337,6 +346,7 @@ export default function ValidadorCSV() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Error durante la verificación con EmailAwesome");
     } finally {
+      refreshEa(); // actualiza el saldo mostrado
       abortRef.current = null;
       setProgress(null);
       setLoading(false);
@@ -488,6 +498,8 @@ export default function ValidadorCSV() {
     view.summary.invalid_format + view.summary.invalid_mx + view.summary.invalid_mailbox +
     view.summary.invalid_disposable + view.summary.invalid_excluded;
   const risky = view.summary.risky_typo + view.summary.risky_role + view.summary.risky_catchall;
+  // Cuántos correos se enviarían a EmailAwesome: sin confirmar, hasta el máximo elegido y hasta el saldo
+  const eaN = Math.max(0, Math.min(view.unconfirmed, Math.max(eaMax, 0), eaBalance ?? Number.MAX_SAFE_INTEGER));
 
   function downloadClean() {
     const rows = view.results
@@ -732,16 +744,23 @@ export default function ValidadorCSV() {
                     <input
                       type="number"
                       min={1}
-                      max={view.unconfirmed}
+                      max={Math.min(view.unconfirmed, eaBalance ?? view.unconfirmed)}
                       value={eaMax}
                       onChange={(e) => setEaMax(Number(e.target.value))}
                       disabled={loading}
                       className="mt-1 block w-32 rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm"
                     />
                   </label>
-                  <Button onClick={startEa} disabled={loading || eaConfigured === null}>
-                    <Play size={16} /> Verificar {Math.min(view.unconfirmed, Math.max(eaMax, 0)).toLocaleString()} con EmailAwesome
+                  <Button onClick={startEa} disabled={loading || eaConfigured === null || eaN <= 0}>
+                    <Play size={16} /> Verificar {eaN.toLocaleString()} con EmailAwesome
                   </Button>
+                  {eaBalance !== null && (
+                    <span className={eaBalance <= 0 ? "text-red-600" : "text-slate-600"}>
+                      Créditos disponibles: <strong>{eaBalance.toLocaleString()}</strong>
+                      {eaBalance < view.unconfirmed && eaBalance > 0 && " (no alcanzan para todos)"}
+                      {eaBalance <= 0 && " — recarga o espera a tu próximo ciclo"}
+                    </span>
+                  )}
                 </div>
               )}
             </Card>

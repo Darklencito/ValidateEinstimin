@@ -146,7 +146,8 @@ Servicio externo de verificación de buzones que usa créditos de tu plan. Se us
 - Flujo de su API: se crea la validación (POST) y se consulta por `id` hasta que termine (unos 15 s). No usa callback.
 - Los lotes son de 20 correos. Las validaciones que no terminan a tiempo se reanudan con su `id` sin volver a cobrarse.
 - Los resultados «Unknown» no se cobran. Si falla la clave, no hay créditos o hay límite de velocidad, el proceso se detiene con un aviso y se conserva lo ya verificado.
-- Scripts de diagnóstico: `node scripts/ea-test.js` (crea 1 validación, gasta 1 crédito) y `node scripts/ea-poll.js` (consulta una existente, no gasta).
+- La tarjeta muestra tus **créditos disponibles** (`GET /billing/me`) y limita el máximo a enviar a ese saldo. Si no se puede leer el saldo, simplemente no se muestra.
+- Scripts de diagnóstico: `node scripts/ea-test.js` (crea 1 validación, gasta 1 crédito), `node scripts/ea-poll.js` (consulta una existente, no gasta) y `node scripts/ea-balance.js` (muestra el saldo, no gasta).
 ## Estructura
 
 ```
