@@ -399,6 +399,7 @@ export default function ValidadorCSV() {
       setError(e instanceof Error ? e.message : "Error durante la verificación externa");
     } finally {
       refreshEa(); // actualiza los saldos mostrados
+      window.dispatchEvent(new Event("credits:refresh")); // y el panel lateral
       abortRef.current = null;
       setProgress(null);
       setLoading(false);
@@ -589,7 +590,7 @@ export default function ValidadorCSV() {
         <h1 className="text-2xl font-semibold">Validador de correos</h1>
         <p className="text-sm text-slate-500">
           Sube un CSV con una columna de correos. Pasa por 3 capas: sintaxis y listas, dominio (MX) y,
-          opcionalmente, verificación SMTP del buzón.
+          opcionalmente, verificación SMTP del buzón. Después puedes confirmar los dudosos con un proveedor externo (capa 4).
         </p>
       </div>
 

@@ -39,10 +39,10 @@ export default function LoginPage() {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center p-4">
+    <main className="flex min-h-screen items-center justify-center bg-gradient-to-br from-indigo-100 via-white to-violet-100 p-4">
       <Card className="w-full max-w-sm">
         <div className="mb-6 flex flex-col items-center gap-2">
-          <div className="rounded-full bg-indigo-100 p-3 text-indigo-600">
+          <div className="rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-600 p-3 text-white shadow-lg shadow-indigo-200">
             <FileSpreadsheet size={28} />
           </div>
           <h1 className="text-xl font-semibold">CSV Manager</h1>
