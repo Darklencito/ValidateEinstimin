@@ -1,0 +1,35 @@
+{
+  "name": "csv-manager",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "hash": "node scripts/hash-password.js"
+  },
+  "dependencies": {
+    "@tanstack/react-table": "^8.20.5",
+    "bcryptjs": "^2.4.3",
+    "disposable-email-domains": "^1.0.62",
+    "jose": "^5.9.6",
+    "lucide-react": "^0.454.0",
+    "next": "14.2.18",
+    "papaparse": "^5.4.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "socks": "^2.8.10"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^20.17.0",
+    "@types/papaparse": "^5.3.15",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.14",
+    "typescript": "^5.6.3"
+  }
+}
