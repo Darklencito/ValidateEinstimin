@@ -81,3 +81,24 @@ export interface EaBatchResponse {
   }[];
   fatal?: string;
 }
+
+/** Un proveedor de verificación externa (capa 4) tal como lo ve el navegador */
+export interface ExtProviderInfo {
+  id: string;
+  name: string;
+  configured: boolean;
+  /** Créditos restantes, o null si el proveedor no permite consultarlos */
+  balance: number | null;
+  /** Costo en USD por correo enviado, si se cobra por uso (null si se paga con créditos de un plan) */
+  costPerEmail: number | null;
+  unit: string;
+  /** Dominios que este proveedor NO puede confirmar y que no vale la pena enviarle (regex) */
+  skipDomainRegex: string | null;
+  maxBatch: number;
+}
+
+export interface VerifiersStatus {
+  /** Orden del modo automático (el siguiente se usa cuando uno se queda sin créditos) */
+  order: string[];
+  providers: ExtProviderInfo[];
+}

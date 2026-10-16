@@ -148,6 +148,13 @@ Servicio externo de verificación de buzones que usa créditos de tu plan. Se us
 - Los resultados «Unknown» no se cobran. Si falla la clave, no hay créditos o hay límite de velocidad, el proceso se detiene con un aviso y se conserva lo ya verificado.
 - La tarjeta muestra tus **créditos disponibles** (`GET /billing/me`) y limita el máximo a enviar a ese saldo. Si no se puede leer el saldo, simplemente no se muestra.
 - Scripts de diagnóstico: `node scripts/ea-test.js` (crea 1 validación, gasta 1 crédito), `node scripts/ea-poll.js` (consulta una existente, no gasta) y `node scripts/ea-balance.js` (muestra el saldo, no gasta).
+### Segundo proveedor: emailval (opcional)
+
+- Variable: `EMAILVAL_API_KEY`. Se cobra **por correo enviado** (≈ US$ 0,0008, también los inválidos) con cargo a tu tarjeta a fin de mes: **no hay un tope automático**, por eso la app te pide confirmar y limita el envío al máximo que elijas.
+- Según su propio sitio, **Gmail, Outlook/Hotmail, Yahoo y Apple no permiten confirmar el buzón** (puntaje máximo 60), así que la app **no les envía esos dominios** para no pagar sin obtener información.
+- Responde de forma síncrona y en lotes de hasta 100 desde la app (la API admite 500).
+- Selector en pantalla: **Automático** (usa los proveedores en orden y, si uno se queda sin créditos o falla, continúa con el siguiente), o uno en concreto. El orden se cambia con `VERIFIER_ORDER` (por defecto `emailawesome,emailval`).
+- Un correo ya enviado a un proveedor no se reenvía a otro en la misma ejecución, para no cobrarlo dos veces.
 ## Estructura
 
 ```

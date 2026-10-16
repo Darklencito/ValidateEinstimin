@@ -9,8 +9,8 @@ import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { downloadCsv, toCsv } from "@/lib/csv";
 import {
-  STATUS_LABEL, emptySummary, type EaBatchResponse, type EmailResult, type EmailStatus, type SmtpBatchResponse,
-  type StreamEvent, type ValidationResponse,
+  STATUS_LABEL, emptySummary, type EaBatchResponse, type EmailResult, type EmailStatus, type ExtProviderInfo, type SmtpBatchResponse,
+  type StreamEvent, type ValidationResponse, type VerifiersStatus,
 } from "@/lib/validation-types";
 import { ValidationProgressModal, type LiveProgress } from "@/components/ValidationProgressModal";
 
@@ -84,22 +84,31 @@ export default function ValidadorCSV() {
   const [onePerCell, setOnePerCell] = useState(true);
   const [strictSmtp, setStrictSmtp] = useState(false);
 
-  // Capa 4: verificación externa con EmailAwesome (opcional, usa créditos)
-  const [eaConfigured, setEaConfigured] = useState<boolean | null>(null);
+  // Capa 4: verificación externa (EmailAwesome / emailval), opcional y con costo
+  const [verifiers, setVerifiers] = useState<VerifiersStatus | null>(null);
+  const [extMode, setExtMode] = useState<string>("auto"); // "auto" o el id de un proveedor
   const [eaMax, setEaMax] = useState(500);
-  const [eaBalance, setEaBalance] = useState<number | null>(null);
-  /** Consulta si hay clave configurada y cuántos créditos quedan. */
+  /** Consulta qué proveedores hay configurados y su saldo. */
   const refreshEa = () =>
     fetch("/api/ea-status")
       .then((r) => r.json())
-      .then((j) => {
-        setEaConfigured(!!j.configured);
-        setEaBalance(typeof j.balance === "number" ? j.balance : null);
-      })
-      .catch(() => setEaConfigured(false));
+      .then((j: VerifiersStatus) => setVerifiers(j))
+      .catch(() => setVerifiers({ order: [], providers: [] }));
   useEffect(() => {
     refreshEa();
   }, []);
+
+  // Proveedores que se usarían según el modo elegido, en orden
+  const extProviders = useMemo<ExtProviderInfo[]>(() => {
+    if (!verifiers) return [];
+    const configured = verifiers.providers.filter((p) => p.configured);
+    if (extMode === "auto") {
+      return verifiers.order
+        .map((id) => configured.find((p) => p.id === id))
+        .filter((p): p is ExtProviderInfo => !!p);
+    }
+    return configured.filter((p) => p.id === extMode);
+  }, [verifiers, extMode]);
 
   // ---------- Prueba de conexión al puerto 25 ----------
   async function testConnection() {
@@ -216,125 +225,168 @@ export default function ValidadorCSV() {
     });
   }
 
-  // ---------- Capa 4: EmailAwesome (API externa, usa créditos) ----------
+  // ---------- Capa 4: verificación externa (usa créditos o dinero) ----------
   /**
-   * Envía a EmailAwesome los correos que siguen sin confirmar (hasta `maxSend`), en lotes pequeños.
-   * Las validaciones que no terminan a tiempo se reanudan con su id, sin volver a cobrarse.
+   * Envía a los proveedores externos (en el orden indicado) los correos que siguen sin confirmar.
+   * Si un proveedor se queda sin créditos o falla, continúa con el siguiente. Un correo ya enviado
+   * en esta ejecución no se reenvía a otro proveedor, para no cobrarlo dos veces.
    */
-  async function runEa(base: ValidationResponse, controller: AbortController, maxSend: number) {
+  async function runExternal(
+    base: ValidationResponse,
+    controller: AbortController,
+    providers: ExtProviderInfo[],
+    maxSend: number
+  ) {
     const results = base.results.map((r) => ({ ...r }));
     const index = new Map<string, number>();
     results.forEach((r, i) => index.set(r.email.toLowerCase(), i));
 
-    const candidates = pickOnePerCell(results, onePerCell)
-      .filter((r) => r.status === "valid" && !r.confirmed)
-      .map((r) => r.email)
-      .slice(0, Math.max(maxSend, 0));
-
-    const SIZE = 20;
+    const sent = new Set<string>(); // correos ya enviados a algún proveedor en esta ejecución
+    const notes: string[] = [];
     const recent: EmailResult[] = [];
     const layerCounts: [number, number, number, number] = [0, 0, 0, 0];
-    const pendingIds = new Map<string, string>(); // correo -> id de validación sin terminar
     let done = 0;
-    let stopReason = "";
+    let budget = Math.max(maxSend, 0); // correos que aún se pueden enviar en total
+    const total = budget;
+    let unfinished = 0;
 
     const show = (statusText: string) =>
       setProgress({
-        done, total: candidates.length, phase: "ea", statusText,
+        done, total, phase: "ea", statusText,
         recent: recent.slice(0, 40), layerCounts: [...layerCounts],
         ...tally(pickOnePerCell(results, onePerCell)),
       });
 
-    /** Envía un lote (nuevos y/o reanudados) y aplica lo que haya terminado. Devuelve false si hay que parar. */
-    async function send(emails: string[], resume: { email: string; id: string }[]): Promise<boolean> {
-      let res: EaBatchResponse;
-      try {
-        const r = await fetch("/api/ea-batch", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ emails, resume }),
-          signal: controller.signal,
+    for (let pi = 0; pi < providers.length; pi++) {
+      const p = providers[pi];
+      if (controller.signal.aborted || budget <= 0) break;
+
+      // Correos aún sin confirmar y que este proveedor puede aportar algo
+      const skip = p.skipDomainRegex ? new RegExp(p.skipDomainRegex, "i") : null;
+      let skipped = 0;
+      let list = pickOnePerCell(results, onePerCell)
+        .filter((r) => r.status === "valid" && !r.confirmed && !sent.has(r.email.toLowerCase()))
+        .map((r) => r.email)
+        .filter((e) => {
+          if (skip && skip.test(e.split("@")[1] ?? "")) {
+            skipped++;
+            return false;
+          }
+          return true;
         });
-        if (r.status === 401) {
-          window.location.href = "/login";
+      if (p.balance !== null) list = list.slice(0, Math.max(p.balance, 0)); // no pasar del saldo
+      list = list.slice(0, budget);
+      if (skipped > 0) {
+        notes.push(`${skipped} correos de Gmail/Outlook/Yahoo/Apple no se enviaron a ${p.name} porque no puede confirmarlos.`);
+      }
+      if (list.length === 0) continue;
+
+      const pending = new Map<string, string>(); // correo -> id de validación sin terminar
+      let stopped = "";
+
+      /** Envía un lote y aplica lo que haya terminado. Devuelve false si hay que parar con este proveedor. */
+      const send = async (emails: string[], resume: { email: string; id: string }[]): Promise<boolean> => {
+        let res: EaBatchResponse;
+        try {
+          const r = await fetch("/api/ea-batch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ provider: p.id, emails, resume }),
+            signal: controller.signal,
+          });
+          if (r.status === 401) {
+            window.location.href = "/login";
+            return false;
+          }
+          const json = await r.json().catch(() => ({}));
+          if (!r.ok) {
+            stopped = json.error ?? `Error del servidor al consultar ${p.name}.`;
+            return false;
+          }
+          res = json as EaBatchResponse;
+        } catch (e) {
+          if (!isAbort(e)) stopped = `Se perdió la conexión con el servidor durante la verificación con ${p.name}.`;
           return false;
         }
-        const json = await r.json().catch(() => ({}));
-        if (!r.ok) {
-          stopReason = json.error ?? "Error del servidor al consultar EmailAwesome.";
+
+        for (const it of res.items) {
+          const i = index.get(it.email.toLowerCase());
+          if (it.state === "done" && it.status && i !== undefined) {
+            results[i] = { ...results[i], status: it.status, reason: it.reason ?? "", confirmed: !!it.confirmed, layer: 4 };
+            pending.delete(it.email);
+            recent.unshift(results[i]);
+            layerCounts[3]++;
+            done++;
+          } else if (it.id) {
+            pending.set(it.email, it.id); // creada pero sin terminar: se reanuda después
+          }
+        }
+        if (recent.length > 40) recent.length = 40;
+        if (res.fatal) {
+          stopped = res.fatal;
           return false;
         }
-        res = json as EaBatchResponse;
-      } catch (e) {
-        if (!isAbort(e)) stopReason = "Se perdió la conexión con el servidor durante la verificación con EmailAwesome.";
-        return false;
+        return true;
+      };
+
+      const size = p.maxBatch;
+      const nBatches = Math.ceil(list.length / size);
+      for (let b = 0; b < nBatches && !controller.signal.aborted; b++) {
+        const slice = list.slice(b * size, (b + 1) * size);
+        slice.forEach((e) => sent.add(e.toLowerCase()));
+        budget -= slice.length;
+        show(`${p.name}: lote ${b + 1} de ${nBatches} · esperando respuesta de ${slice.length} correos...`);
+        if (!(await send(slice, []))) break;
       }
 
-      for (const it of res.items) {
-        const i = index.get(it.email.toLowerCase());
-        if (it.state === "done" && it.status && i !== undefined) {
-          results[i] = { ...results[i], status: it.status, reason: it.reason ?? "", confirmed: !!it.confirmed, layer: 4 };
-          pendingIds.delete(it.email);
-          recent.unshift(results[i]);
-          layerCounts[3]++;
-          done++;
-        } else if (it.id) {
-          pendingIds.set(it.email, it.id); // creada pero sin terminar: se reanuda después
+      // Reanudar (hasta 3 rondas) las validaciones que no terminaron a tiempo (solo EmailAwesome las crea así)
+      for (let round = 1; round <= 3 && pending.size > 0 && !stopped && !controller.signal.aborted; round++) {
+        const rl = [...pending.entries()].map(([email, id]) => ({ email, id }));
+        for (let k = 0; k < rl.length && !controller.signal.aborted; k += size) {
+          show(`${p.name}: reanudando ${rl.length} validaciones pendientes (ronda ${round})...`);
+          if (!(await send([], rl.slice(k, k + size)))) break;
         }
       }
-      if (recent.length > 40) recent.length = 40;
-      if (res.fatal) {
-        stopReason = res.fatal;
-        return false;
-      }
-      return true;
-    }
+      unfinished += pending.size;
 
-    show("Enviando correos a EmailAwesome...");
-    for (let b = 0; b * SIZE < candidates.length && !controller.signal.aborted; b++) {
-      const slice = candidates.slice(b * SIZE, (b + 1) * SIZE);
-      show(`Lote ${b + 1} de ${Math.ceil(candidates.length / SIZE)} · esperando respuesta de ${slice.length} correos (≈15 s)...`);
-      if (!(await send(slice, []))) break;
-      show(`Lote ${b + 1} de ${Math.ceil(candidates.length / SIZE)} listo`);
-    }
-
-    // Reanudar (hasta 3 rondas) las validaciones que no terminaron a tiempo
-    for (let round = 1; round <= 3 && pendingIds.size > 0 && !stopReason && !controller.signal.aborted; round++) {
-      const list = [...pendingIds.entries()].map(([email, id]) => ({ email, id }));
-      for (let k = 0; k < list.length && !controller.signal.aborted; k += SIZE) {
-        show(`Reanudando ${list.length} validaciones pendientes (ronda ${round})...`);
-        if (!(await send([], list.slice(k, k + SIZE)))) break;
+      if (stopped) {
+        const next = providers[pi + 1];
+        notes.push(`${p.name}: ${stopped}${next && !controller.signal.aborted ? ` Se continúa con ${next.name}.` : ""}`);
       }
     }
 
-    if (controller.signal.aborted && !stopReason) {
-      stopReason = "Verificación con EmailAwesome detenida. Lo ya verificado se conserva.";
+    if (controller.signal.aborted) {
+      notes.push("Verificación externa detenida. Lo ya verificado se conserva.");
     }
-    const unfinished = pendingIds.size;
+    if (unfinished > 0) {
+      notes.push(`${unfinished} validaciones no terminaron a tiempo; siguen como «no concluyentes».`);
+    }
     const summary = emptySummary();
     results.forEach((r) => summary[r.status]++);
     setData({
       ...base, results, summary,
-      notice:
-        stopReason ||
-        (unfinished > 0
-          ? `${unfinished} validaciones de EmailAwesome no terminaron a tiempo; siguen como «no concluyentes».`
-          : candidates.length === 0
-            ? "No había correos sin confirmar para enviar a EmailAwesome."
-            : undefined),
+      notice: notes.length ? notes.join(" ") : total === 0 ? "No había correos sin confirmar para enviar." : undefined,
     });
   }
 
-  /** Lanza la capa 4 sobre los resultados actuales, tras confirmar el gasto de créditos. */
+  /** Lanza la capa 4 sobre los resultados actuales, tras confirmar el gasto. */
   async function startEa() {
-    if (!data) return;
-    const n = eaN; // ya limitado por el máximo elegido y por el saldo disponible
-    if (n <= 0) return;
+    if (!data || eaN <= 0 || extProviders.length === 0) return;
+    const lines = extProviders
+      .map((p) => {
+        const detail =
+          p.balance !== null
+            ? ` (${p.balance.toLocaleString()} créditos disponibles)`
+            : p.costPerEmail !== null
+              ? ` (≈ US$ ${p.costPerEmail} por correo; ≈ US$ ${(eaN * p.costPerEmail).toFixed(2)} si se enviaran todos; se cobra a fin de mes)`
+              : "";
+        return `• ${p.name}${detail}`;
+      })
+      .join("\n");
     const ok = window.confirm(
-      `Se enviarán ${n} correos a EmailAwesome.\n\n` +
-        `Esto consume hasta ${n} créditos de tu plan (los resultados «Unknown» no se cobran).` +
-        (eaBalance !== null ? `\nCréditos disponibles ahora: ${eaBalance}.` : "") +
-        `\n\n¿Continuar?`
+      `Se enviarán hasta ${eaN.toLocaleString()} correos sin confirmar a:\n${lines}\n\n` +
+        (extProviders.length > 1 ? "Si el primero se queda sin créditos, se continuará con el siguiente.\n\n" : "") +
+        `Esto tiene costo (créditos de tu plan o cargo a tu tarjeta). ¿Continuar?`
     );
     if (!ok) return;
     setError("");
@@ -342,11 +394,11 @@ export default function ValidadorCSV() {
     const controller = new AbortController();
     abortRef.current = controller;
     try {
-      await runEa(data, controller, n);
+      await runExternal(data, controller, extProviders, eaN);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Error durante la verificación con EmailAwesome");
+      setError(e instanceof Error ? e.message : "Error durante la verificación externa");
     } finally {
-      refreshEa(); // actualiza el saldo mostrado
+      refreshEa(); // actualiza los saldos mostrados
       abortRef.current = null;
       setProgress(null);
       setLoading(false);
@@ -498,8 +550,9 @@ export default function ValidadorCSV() {
     view.summary.invalid_format + view.summary.invalid_mx + view.summary.invalid_mailbox +
     view.summary.invalid_disposable + view.summary.invalid_excluded;
   const risky = view.summary.risky_typo + view.summary.risky_role + view.summary.risky_catchall;
-  // Cuántos correos se enviarían a EmailAwesome: sin confirmar, hasta el máximo elegido y hasta el saldo
-  const eaN = Math.max(0, Math.min(view.unconfirmed, Math.max(eaMax, 0), eaBalance ?? Number.MAX_SAFE_INTEGER));
+  // Cuántos correos se enviarían: sin confirmar, hasta el máximo elegido y hasta el saldo de los proveedores elegidos
+  const extCapacity = extProviders.reduce((s, p) => s + (p.balance ?? Infinity), 0);
+  const eaN = Math.max(0, Math.min(view.unconfirmed, Math.max(eaMax, 0), extCapacity));
 
   function downloadClean() {
     const rows = view.results
@@ -722,46 +775,107 @@ export default function ValidadorCSV() {
             </Card>
           ) : null}
 
-          {/* Capa 4: EmailAwesome (opcional, usa créditos) */}
+          {/* Capa 4: verificación externa (opcional, con costo) */}
           {view.unconfirmed > 0 && (
             <Card className="space-y-3 border-slate-200 text-sm">
               <div>
-                <p className="font-medium">Capa 4: verificación externa con EmailAwesome (opcional)</p>
+                <p className="font-medium">Capa 4: verificación externa (opcional)</p>
                 <p className="text-slate-500">
                   Hay <strong>{view.unconfirmed.toLocaleString()}</strong> correos válidos que ningún servidor confirmó
-                  (no concluyentes o sin SMTP). EmailAwesome puede confirmarlos. Cada correo consume 1 crédito de tu
-                  plan; los resultados «Unknown» no se cobran. Nunca se envía nada sin que lo confirmes.
+                  (no concluyentes o sin SMTP). Un proveedor externo puede confirmarlos, pero <strong>tiene costo</strong>.
+                  Nunca se envía nada sin que lo confirmes.
                 </p>
               </div>
-              {eaConfigured === false ? (
+
+              {verifiers && verifiers.providers.every((p) => !p.configured) ? (
                 <p className="rounded-lg bg-amber-50 p-2 text-amber-800">
-                  Falta la variable de entorno <code>EMAILAWESOME_API_KEY</code> en el servidor.
+                  Configura al menos una clave en el servidor: <code>EMAILAWESOME_API_KEY</code> o{" "}
+                  <code>EMAILVAL_API_KEY</code>.
                 </p>
               ) : (
-                <div className="flex flex-wrap items-end gap-3">
-                  <label className="text-xs text-slate-600">
-                    Máximo de correos a enviar
-                    <input
-                      type="number"
-                      min={1}
-                      max={Math.min(view.unconfirmed, eaBalance ?? view.unconfirmed)}
-                      value={eaMax}
-                      onChange={(e) => setEaMax(Number(e.target.value))}
-                      disabled={loading}
-                      className="mt-1 block w-32 rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm"
-                    />
-                  </label>
-                  <Button onClick={startEa} disabled={loading || eaConfigured === null || eaN <= 0}>
-                    <Play size={16} /> Verificar {eaN.toLocaleString()} con EmailAwesome
-                  </Button>
-                  {eaBalance !== null && (
-                    <span className={eaBalance <= 0 ? "text-red-600" : "text-slate-600"}>
-                      Créditos disponibles: <strong>{eaBalance.toLocaleString()}</strong>
-                      {eaBalance < view.unconfirmed && eaBalance > 0 && " (no alcanzan para todos)"}
-                      {eaBalance <= 0 && " — recarga o espera a tu próximo ciclo"}
-                    </span>
-                  )}
-                </div>
+                <>
+                  <div className="space-y-2">
+                    <label className="flex items-start gap-2">
+                      <input
+                        type="radio"
+                        name="extMode"
+                        className="mt-1"
+                        checked={extMode === "auto"}
+                        onChange={() => setExtMode("auto")}
+                        disabled={loading}
+                      />
+                      <span>
+                        <strong>Automático</strong>: usa los proveedores en este orden y, si uno se queda sin
+                        créditos o falla, continúa con el siguiente
+                        {verifiers && (
+                          <span className="text-slate-500">
+                            {" "}
+                            ({verifiers.order
+                              .map((id) => verifiers.providers.find((p) => p.id === id))
+                              .filter((p) => p?.configured)
+                              .map((p) => p!.name)
+                              .join(" → ") || "—"})
+                          </span>
+                        )}
+                        .
+                      </span>
+                    </label>
+
+                    {verifiers?.providers.map((p) => (
+                      <label key={p.id} className={`flex items-start gap-2 ${p.configured ? "" : "opacity-50"}`}>
+                        <input
+                          type="radio"
+                          name="extMode"
+                          className="mt-1"
+                          checked={extMode === p.id}
+                          onChange={() => setExtMode(p.id)}
+                          disabled={loading || !p.configured}
+                        />
+                        <span>
+                          <strong>{p.name}</strong>
+                          {!p.configured && " (sin clave configurada)"}
+                          {p.balance !== null && (
+                            <>
+                              {" "}· créditos: <strong className={p.balance <= 0 ? "text-red-600" : ""}>{p.balance.toLocaleString()}</strong>
+                            </>
+                          )}
+                          {p.costPerEmail !== null && (
+                            <> · ≈ US$ {p.costPerEmail} por correo enviado (también los inválidos), cobrado a fin de mes</>
+                          )}
+                          {p.skipDomainRegex && (
+                            <span className="block text-xs text-amber-700">
+                              No se le envían Gmail/Outlook/Yahoo/Apple: según el propio proveedor no puede confirmar esos
+                              buzones (puntaje máximo 60), y se cobrarían igual.
+                            </span>
+                          )}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+
+                  <div className="flex flex-wrap items-end gap-3">
+                    <label className="text-xs text-slate-600">
+                      Máximo de correos a enviar
+                      <input
+                        type="number"
+                        min={1}
+                        max={view.unconfirmed}
+                        value={eaMax}
+                        onChange={(e) => setEaMax(Number(e.target.value))}
+                        disabled={loading}
+                        className="mt-1 block w-32 rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm"
+                      />
+                    </label>
+                    <Button onClick={startEa} disabled={loading || verifiers === null || eaN <= 0}>
+                      <Play size={16} /> Verificar {eaN.toLocaleString()} correos
+                    </Button>
+                    {extProviders.length === 1 && extProviders[0].costPerEmail !== null && eaN > 0 && (
+                      <span className="text-slate-600">
+                        Costo máximo estimado: <strong>US$ {(eaN * extProviders[0].costPerEmail).toFixed(2)}</strong>
+                      </span>
+                    )}
+                  </div>
+                </>
               )}
             </Card>
           )}
