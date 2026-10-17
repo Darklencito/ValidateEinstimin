@@ -5,7 +5,7 @@ Aplicación Next.js 14 (App Router) + TypeScript + Tailwind CSS con login JWT, v
 ## Funcionalidades
 
 - **Login** con usuario/contraseña (bcrypt) y JWT (`jose`) en cookie HttpOnly, Secure y SameSite=Strict.
-- **Validador** (`/dashboard/validador`): formato, registros MX y verificación SMTP opcional.
+- **Validador** (`/dashboard/validador`): por etapas. **Paso 1** (automático y gratis): formato, listas y MX. **Paso 2** (gratis, lo pides tú): verificación SMTP por lotes. **Paso 3** (con costo, lo pides tú): proveedor externo para los que sigan sin confirmar.
 - **Constructor** (`/dashboard/constructor`): tabla con orden, filtros, selección de filas/columnas y descarga.
 
 ## Instalación
@@ -84,7 +84,7 @@ npm start
 
 ### Cómo funciona
 1. Las capas 1 y 2 (sintaxis/listas y MX) se ejecutan sobre todo el archivo.
-2. Si activas la capa 3, el navegador envía los correos válidos en **lotes** (20–120) con una **pausa** entre lotes.
+2. La capa 3 **no se ejecuta sola**: tras ver los resultados de las capas 1 y 2 aparece el «Paso 2» y tú pulsas «Verificar por SMTP». Entonces el navegador envía los correos válidos en **lotes** (20–120) con una **pausa** entre lotes.
 3. Por cada dominio de destino se abre **una sola conexión** que se reutiliza para varios correos, con una pausa entre consultas (`SMTP_DELAY_MS`). El catch-all se comprueba una vez por dominio.
 4. Si un servidor pide esperar (respuestas 4xx), la pausa entre lotes se duplica automáticamente.
 5. Si ningún correo de un lote se puede consultar, se detiene con un aviso (puerto 25 bloqueado) en vez de seguir.

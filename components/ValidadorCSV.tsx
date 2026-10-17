@@ -74,7 +74,6 @@ export default function ValidadorCSV() {
   const [excludeFile, setExcludeFile] = useState<File | null>(null);
 
   // Capa 3 (SMTP) por lotes
-  const [smtp, setSmtp] = useState(false);
   const [batchSize, setBatchSize] = useState(40);
   const [pauseSec, setPauseSec] = useState(10);
   const [checking, setChecking] = useState(false);
@@ -496,8 +495,6 @@ export default function ValidadorCSV() {
       const base: ValidationResponse = { total: results.length, summary, results, ...(meta as StreamMeta) };
       setData(base);
 
-      // Capa 3 (opcional), por lotes
-      if (smtp) await runSmtp(base, controller);
     } catch (e) {
       setError(isAbort(e) ? "Validación cancelada." : e instanceof Error ? e.message : "Error de conexión");
     } finally {
@@ -589,82 +586,12 @@ export default function ValidadorCSV() {
       <div>
         <h1 className="text-2xl font-semibold">Validador de correos</h1>
         <p className="text-sm text-slate-500">
-          Sube un CSV con una columna de correos. Pasa por 3 capas: sintaxis y listas, dominio (MX) y,
-          opcionalmente, verificación SMTP del buzón. Después puedes confirmar los dudosos con un proveedor externo (capa 4).
+          Sube un CSV con una columna de correos. Paso 1: se valida gratis (formato, dominio y listas). Luego tú decides si
+          confirmar los dudosos por SMTP (gratis, más lento) y, al final, si usar un proveedor externo (con costo).
         </p>
       </div>
 
       <Card className="space-y-4">
-        {/* Capa 3: SMTP */}
-        <div className="rounded-lg border border-slate-200 p-3 text-sm">
-          <label className="flex cursor-pointer items-start gap-2">
-            <input
-              type="checkbox"
-              checked={smtp}
-              onChange={(e) => setSmtp(e.target.checked)}
-              disabled={loading}
-              className="mt-0.5"
-            />
-            <span>
-              <strong>Capa 3: verificación SMTP por lotes (opcional)</strong>
-              <span className="block text-slate-500">
-                Confirma si el buzón existe. Solo se consultan los correos que pasaron las capas 1 y 2,
-                en lotes pequeños con pausas para no saturar al servidor ni bloquear tu hosting. Es lenta:
-                una lista de miles puede tardar horas (mantén esta pestaña abierta).
-              </span>
-            </span>
-          </label>
-
-          {smtp && (
-            <div className="mt-3 space-y-3 border-t border-slate-100 pt-3">
-              <div className="flex flex-wrap items-end gap-4">
-                <label className="text-xs text-slate-600">
-                  Correos por lote
-                  <select
-                    className="mt-1 block rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm"
-                    value={batchSize}
-                    onChange={(e) => setBatchSize(Number(e.target.value))}
-                    disabled={loading}
-                  >
-                    {[20, 40, 80, 120].map((n) => <option key={n} value={n}>{n}</option>)}
-                  </select>
-                </label>
-                <label className="text-xs text-slate-600">
-                  Pausa entre lotes
-                  <select
-                    className="mt-1 block rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm"
-                    value={pauseSec}
-                    onChange={(e) => setPauseSec(Number(e.target.value))}
-                    disabled={loading}
-                  >
-                    {[5, 10, 20, 30, 60].map((n) => <option key={n} value={n}>{n} s</option>)}
-                  </select>
-                </label>
-                <Button variant="secondary" onClick={testConnection} disabled={checking || loading}>
-                  {checking ? <Loader2 size={16} className="animate-spin" /> : <Wifi size={16} />}
-                  Probar conexión SMTP
-                </Button>
-              </div>
-
-              {connectivity && (
-                <ul className="space-y-1 text-xs">
-                  {connectivity.map((c, i) => (
-                    <li
-                      key={i}
-                      className={`flex items-start gap-1.5 rounded-lg p-2 ${
-                        c.ok ? "bg-green-50 text-green-800" : "bg-red-50 text-red-700"
-                      }`}
-                    >
-                      {c.ok ? <CheckCircle2 size={14} className="mt-0.5 shrink-0" /> : <XCircle size={14} className="mt-0.5 shrink-0" />}
-                      <span><strong>{c.via}</strong> · {c.ms} ms · {c.message}</span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          )}
-        </div>
-
         {/* Lista de exclusión */}
         <div className="rounded-lg border border-slate-200 p-3 text-sm">
           <p className="font-medium">Lista de exclusión (opcional, recomendado para Brevo)</p>
@@ -756,36 +683,148 @@ export default function ValidadorCSV() {
             </div>
           )}
 
-          {/* Continuar / reintentar SMTP */}
-          {(view.pending > 0 && view.hasSmtp) || view.inconclusive > 0 ? (
-            <Card className="flex flex-wrap items-center gap-3 border-indigo-200 bg-indigo-50 text-sm">
-              <span className="flex-1">
-                {view.pending > 0 && view.hasSmtp && <>Quedan <strong>{view.pending}</strong> correos sin verificar por SMTP. </>}
-                {view.inconclusive > 0 && <><strong>{view.inconclusive}</strong> quedaron «no concluyentes» (el servidor no dio una respuesta clara). </>}
-              </span>
-              {view.pending > 0 && view.hasSmtp && (
-                <Button onClick={() => continueSmtp(false)} disabled={loading}>
-                  <Play size={16} /> Continuar verificación SMTP
-                </Button>
-              )}
-              {view.inconclusive > 0 && (
-                <Button variant="secondary" onClick={() => continueSmtp(true)} disabled={loading}>
-                  <RefreshCw size={16} /> Reintentar no concluyentes
-                </Button>
-              )}
+          {data.multiCells > 0 && (
+            <Card className="border-indigo-200 bg-indigo-50">
+              <label className="flex cursor-pointer items-start gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={onePerCell}
+                  onChange={(e) => setOnePerCell(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span>
+                  <strong>Unir: dejar solo 1 correo por celda</strong>
+                  <span className="block text-slate-600">
+                    Se detectaron {data.multiCells} celda(s) con varios correos (por ejemplo
+                    «aaa@aa.com / aaab@aa.com»). Se conserva el primer correo válido de cada una
+                    {onePerCell ? ` y se descartan ${view.discarded} correo(s) sobrantes` : ""}.
+                    Desmárcalo para conservar todos.
+                  </span>
+                </span>
+              </label>
             </Card>
-          ) : null}
+          )}
+
+          {data.excludedListSize > 0 && (
+            <div className="flex items-center gap-2 rounded-lg bg-indigo-50 p-3 text-sm text-indigo-800">
+              <Info size={16} /> Se usó tu lista de exclusión ({data.excludedListSize} correos).
+            </div>
+          )}
+
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+            <Stat icon={<CheckCircle2 />} label="Válidos (seguros para enviar)" value={view.summary.valid} color="text-green-600" />
+            <Stat icon={<XCircle />} label="Inválidos / excluidos" value={invalid} color="text-red-600"
+              hint={`Formato ${view.summary.invalid_format} · MX ${view.summary.invalid_mx} · Buzón ${view.summary.invalid_mailbox} · Desechables ${view.summary.invalid_disposable} · Lista ${view.summary.invalid_excluded}`} />
+            <Stat icon={<ShieldAlert />} label="Riesgo (no incluidos)" value={risky} color="text-amber-600"
+              hint={`Tipeo ${view.summary.risky_typo} · Genéricas ${view.summary.risky_role} · Catch-all ${view.summary.risky_catchall}`} />
+            <Stat icon={<FileUp />} label="Total únicos" value={view.total} color="text-slate-700" />
+          </div>
+
+          {/* Capa 3: SMTP gratis, solo cuando tú lo pides */}
+          {(view.pending > 0 || view.inconclusive > 0) && (
+            <Card className="space-y-3 border-slate-200 text-sm">
+              <div>
+                <p className="flex items-center gap-2 font-medium">
+                  Paso 2 · Capa 3: verificación SMTP
+                  <span className="rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">gratis</span>
+                </p>
+                <p className="text-slate-500">
+                  {view.hasSmtp ? (
+                    <>
+                      {view.pending > 0 && <>Quedan <strong>{view.pending.toLocaleString()}</strong> correos sin verificar por SMTP. </>}
+                      {view.inconclusive > 0 && (
+                        <><strong>{view.inconclusive.toLocaleString()}</strong> quedaron «no concluyentes» (el servidor no dio una respuesta clara). </>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <strong>{view.pending.toLocaleString()}</strong> correos pasaron las capas 1 y 2 (formato, dominio y MX).{" "}
+                    </>
+                  )}
+                  Esta capa pregunta al servidor de correo si el buzón existe, <strong>sin costo</strong>. Se hace por
+                  lotes con pausas para no saturar al servidor ni bloquear tu hosting. Es lenta: una lista grande puede
+                  tardar horas (mantén esta pestaña abierta). Hazla <strong>antes</strong> de usar créditos: reduce
+                  cuántos correos tendrás que pagar.
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-end gap-4">
+                <label className="text-xs text-slate-600">
+                  Correos por lote
+                  <select
+                    className="mt-1 block rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm"
+                    value={batchSize}
+                    onChange={(e) => setBatchSize(Number(e.target.value))}
+                    disabled={loading}
+                  >
+                    {[20, 40, 80, 120].map((n) => <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </label>
+                <label className="text-xs text-slate-600">
+                  Pausa entre lotes
+                  <select
+                    className="mt-1 block rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm"
+                    value={pauseSec}
+                    onChange={(e) => setPauseSec(Number(e.target.value))}
+                    disabled={loading}
+                  >
+                    {[5, 10, 20, 30, 60].map((n) => <option key={n} value={n}>{n} s</option>)}
+                  </select>
+                </label>
+                <Button variant="secondary" onClick={testConnection} disabled={checking || loading}>
+                  {checking ? <Loader2 size={16} className="animate-spin" /> : <Wifi size={16} />}
+                  Probar conexión SMTP
+                </Button>
+              </div>
+
+              {connectivity && (
+                <ul className="space-y-1 text-xs">
+                  {connectivity.map((c, i) => (
+                    <li
+                      key={i}
+                      className={`flex items-start gap-1.5 rounded-lg p-2 ${
+                        c.ok ? "bg-green-50 text-green-800" : "bg-red-50 text-red-700"
+                      }`}
+                    >
+                      {c.ok ? <CheckCircle2 size={14} className="mt-0.5 shrink-0" /> : <XCircle size={14} className="mt-0.5 shrink-0" />}
+                      <span><strong>{c.via}</strong> · {c.ms} ms · {c.message}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              <div className="flex flex-wrap gap-2">
+                {view.pending > 0 && (
+                  <Button onClick={() => continueSmtp(false)} disabled={loading}>
+                    <Play size={16} />
+                    {view.hasSmtp ? "Continuar verificación SMTP" : `Verificar ${view.pending.toLocaleString()} por SMTP`}
+                  </Button>
+                )}
+                {view.inconclusive > 0 && (
+                  <Button variant="secondary" onClick={() => continueSmtp(true)} disabled={loading}>
+                    <RefreshCw size={16} /> Reintentar los no concluyentes
+                  </Button>
+                )}
+              </div>
+            </Card>
+          )}
 
           {/* Capa 4: verificación externa (opcional, con costo) */}
           {view.unconfirmed > 0 && (
             <Card className="space-y-3 border-slate-200 text-sm">
               <div>
-                <p className="font-medium">Capa 4: verificación externa (opcional)</p>
+                <p className="font-medium">Paso 3 · Capa 4: verificación externa (opcional)</p>
                 <p className="text-slate-500">
                   Hay <strong>{view.unconfirmed.toLocaleString()}</strong> correos válidos que ningún servidor confirmó
                   (no concluyentes o sin SMTP). Un proveedor externo puede confirmarlos, pero <strong>tiene costo</strong>.
                   Nunca se envía nada sin que lo confirmes.
                 </p>
+                {view.pending > 0 && (
+                  <p className="mt-2 rounded-lg bg-green-50 p-2 text-green-800">
+                    Todavía no usaste la capa 3 (gratis) en <strong>{view.pending.toLocaleString()}</strong> correos.
+                    Hazla primero: así gastas menos créditos.
+                  </p>
+                )}
               </div>
 
               {verifiers && verifiers.providers.every((p) => !p.configured) ? (
@@ -880,53 +919,6 @@ export default function ValidadorCSV() {
               )}
             </Card>
           )}
-
-          {!view.hasSmtp && view.pending > 0 && (
-            <div className="flex items-start gap-2 rounded-lg bg-slate-100 p-3 text-sm text-slate-700">
-              <Info size={16} className="mt-0.5 shrink-0" />
-              <span>
-                <strong>{view.pending}</strong> correos pasaron las capas 1 y 2. Si activas la capa 3 (SMTP) antes
-                de subir el archivo, también se comprobará que el buzón exista.
-              </span>
-            </div>
-          )}
-
-          {data.multiCells > 0 && (
-            <Card className="border-indigo-200 bg-indigo-50">
-              <label className="flex cursor-pointer items-start gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={onePerCell}
-                  onChange={(e) => setOnePerCell(e.target.checked)}
-                  className="mt-0.5"
-                />
-                <span>
-                  <strong>Unir: dejar solo 1 correo por celda</strong>
-                  <span className="block text-slate-600">
-                    Se detectaron {data.multiCells} celda(s) con varios correos (por ejemplo
-                    «aaa@aa.com / aaab@aa.com»). Se conserva el primer correo válido de cada una
-                    {onePerCell ? ` y se descartan ${view.discarded} correo(s) sobrantes` : ""}.
-                    Desmárcalo para conservar todos.
-                  </span>
-                </span>
-              </label>
-            </Card>
-          )}
-
-          {data.excludedListSize > 0 && (
-            <div className="flex items-center gap-2 rounded-lg bg-indigo-50 p-3 text-sm text-indigo-800">
-              <Info size={16} /> Se usó tu lista de exclusión ({data.excludedListSize} correos).
-            </div>
-          )}
-
-          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-            <Stat icon={<CheckCircle2 />} label="Válidos (seguros para enviar)" value={view.summary.valid} color="text-green-600" />
-            <Stat icon={<XCircle />} label="Inválidos / excluidos" value={invalid} color="text-red-600"
-              hint={`Formato ${view.summary.invalid_format} · MX ${view.summary.invalid_mx} · Buzón ${view.summary.invalid_mailbox} · Desechables ${view.summary.invalid_disposable} · Lista ${view.summary.invalid_excluded}`} />
-            <Stat icon={<ShieldAlert />} label="Riesgo (no incluidos)" value={risky} color="text-amber-600"
-              hint={`Tipeo ${view.summary.risky_typo} · Genéricas ${view.summary.risky_role} · Catch-all ${view.summary.risky_catchall}`} />
-            <Stat icon={<FileUp />} label="Total únicos" value={view.total} color="text-slate-700" />
-          </div>
 
           <Card className="space-y-4">
             {view.hasSmtp && (
