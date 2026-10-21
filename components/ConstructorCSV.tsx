@@ -15,7 +15,7 @@ import Papa from "papaparse";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { Row, downloadCsv, parseCsvFile } from "@/lib/csv";
+import { Row, downloadCsv, isSupportedSpreadsheetName, parseCsvFile } from "@/lib/csv";
 import { consumeBuilderDraft } from "@/lib/storage";
 
 const TEMPLATE_COLUMNS = ["EMAIL", "NOMBRE", "APELLIDOS", "SMS", "CIUDAD"];
@@ -153,14 +153,17 @@ export default function ConstructorCSV() {
 
   async function handleFile(file: File) {
     setNotice("");
-    if (!/\.csv$/i.test(file.name)) return setError("El archivo debe tener extensión .csv");
+    if (!isSupportedSpreadsheetName(file.name)) {
+      return setError("El archivo debe ser .csv, .xls, .xlsx, .ods o .txt");
+    }
     if (file.size > MAX_BYTES) return setError("El archivo supera los 10 MB");
-    const { rows, columns: cols, errors } = await parseCsvFile(file);
+    const { rows, columns: cols, errors, encoding } = await parseCsvFile(file);
     if (cols.length === 0 || rows.length === 0) {
-      return setError("El CSV está vacío o no tiene fila de cabecera");
+      return setError("El archivo está vacío o no tiene fila de cabecera");
     }
     loadData(rows, cols, file.name, true);
-    if (errors.length) setError(`CSV cargado con avisos: ${errors[0]}`);
+    setNotice(`${encoding.summary} · ${rows.length.toLocaleString()} filas cargadas listas para ordenar y exportar a CSV.`);
+    if (errors.length) setError(`Archivo cargado con avisos: ${errors[0]}`);
   }
 
   // Mover columna de posición (izquierda/derecha o drag & drop)
@@ -420,7 +423,7 @@ export default function ConstructorCSV() {
       { delimiter }
     );
 
-    const baseName = fileName ? fileName.replace(/\.csv$/i, "") : "contactos";
+    const baseName = fileName ? fileName.replace(/\.(csv|xlsx?|xlsb|ods|txt)$/i, "") : "contactos";
     downloadCsv(`${baseName}_brevo.csv`, "\uFEFF" + csv);
   }
 
@@ -492,13 +495,17 @@ export default function ConstructorCSV() {
             }`}
           >
             <FileUp className="text-indigo-600" size={36} />
-            <p className="text-sm font-medium">Arrastra tu CSV base aquí o haz clic para seleccionarlo</p>
-            <p className="text-xs text-slate-500">Máx. 10 MB · la primera fila debe ser la cabecera</p>
+            <p className="text-sm font-medium">
+              Arrastra tu CSV o Excel (<code>.xls</code> / <code>.xlsx</code>) aquí o haz clic para seleccionarlo
+            </p>
+            <p className="text-xs text-slate-500">
+              Máx. 10 MB · Convierte Excel (.xls/.xlsx) a CSV UTF-8 manteniendo todas las tildes y ñ
+            </p>
           </div>
           <input
             ref={inputRef}
             type="file"
-            accept=".csv,text/csv"
+            accept=".csv,.xls,.xlsx,.ods,.txt,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             hidden
             onChange={(e) => {
               const f = e.target.files?.[0];

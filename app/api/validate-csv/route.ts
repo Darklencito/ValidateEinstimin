@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { parseCsvText } from "@/lib/csv";
+import { decodeCsvBytes, parseSpreadsheetBuffer } from "@/lib/csv";
 import { mapLimit, validateEmail } from "@/lib/email-validation";
 import type { StreamEvent } from "@/lib/validation-types";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
-const MAX_BYTES = 5 * 1024 * 1024; // 5 MB
+const MAX_BYTES = 10 * 1024 * 1024; // 10 MB (para soportar .xls y .xlsx además de .csv)
 const MAX_EMAILS = 10000;
 
 /** Busca la columna de correos: por nombre, o la primera que contenga "@". */
@@ -27,15 +27,15 @@ export async function POST(req: NextRequest) {
 
   const file = form.get("file");
   if (!(file instanceof File)) {
-    return NextResponse.json({ error: "Falta el archivo CSV" }, { status: 400 });
+    return NextResponse.json({ error: "Falta el archivo CSV o Excel" }, { status: 400 });
   }
   if (file.size > MAX_BYTES) {
-    return NextResponse.json({ error: "El archivo supera los 5 MB" }, { status: 413 });
+    return NextResponse.json({ error: "El archivo supera los 10 MB" }, { status: 413 });
   }
 
-  const { rows, columns } = parseCsvText(await file.text());
+  const { rows, columns } = parseSpreadsheetBuffer(await file.arrayBuffer(), file.name);
   if (columns.length === 0 || rows.length === 0) {
-    return NextResponse.json({ error: "El CSV está vacío o no tiene cabecera" }, { status: 400 });
+    return NextResponse.json({ error: "El archivo está vacío o no tiene fila de cabecera" }, { status: 400 });
   }
 
   const col = detectEmailColumn(columns, rows);
@@ -60,7 +60,7 @@ export async function POST(req: NextRequest) {
     }
   }
   if (entries.length === 0) {
-    return NextResponse.json({ error: "No se encontraron correos en el CSV" }, { status: 400 });
+    return NextResponse.json({ error: "No se encontraron correos en el archivo" }, { status: 400 });
   }
   if (entries.length > MAX_EMAILS) {
     return NextResponse.json(
@@ -69,15 +69,27 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Lista de exclusión opcional (bloqueados / rebotados de Brevo): extrae todos los correos del archivo
+  // Lista de exclusión opcional (bloqueados / rebotados de Brevo): soporta CSV, TXT, XLS, XLSX
   const excluded = new Set<string>();
   const excludeFile = form.get("exclude");
   if (excludeFile instanceof File && excludeFile.size > 0) {
     if (excludeFile.size > MAX_BYTES) {
-      return NextResponse.json({ error: "La lista de exclusión supera los 5 MB" }, { status: 413 });
+      return NextResponse.json({ error: "La lista de exclusión supera los 10 MB" }, { status: 413 });
     }
-    const found = (await excludeFile.text()).toLowerCase().match(/[^\s,;"'<>()]+@[^\s,;"'<>()]+/g);
-    found?.forEach((e) => excluded.add(e.replace(/[.]+$/, "")));
+    const exBuf = await excludeFile.arrayBuffer();
+    if (/\.(xlsx?|xlsb|ods)$/i.test(excludeFile.name)) {
+      const exParsed = parseSpreadsheetBuffer(exBuf, excludeFile.name);
+      for (const r of exParsed.rows) {
+        for (const v of Object.values(r)) {
+          const found = String(v).toLowerCase().match(/[^\s,;"'<>()]+@[^\s,;"'<>()]+/g);
+          found?.forEach((e) => excluded.add(e.replace(/[.]+$/, "")));
+        }
+      }
+    } else {
+      const { text: exText } = decodeCsvBytes(exBuf);
+      const found = exText.toLowerCase().match(/[^\s,;"'<>()]+@[^\s,;"'<>()]+/g);
+      found?.forEach((e) => excluded.add(e.replace(/[.]+$/, "")));
+    }
   }
 
   // Respuesta en streaming (NDJSON): una línea JSON por evento, para mostrar el progreso en vivo
@@ -110,7 +122,6 @@ export async function POST(req: NextRequest) {
         if (!abort.aborted) controller.close();
       }
     },
-    // El cliente canceló (cerró el modal): dejamos de procesar
     cancel() {
       abort.aborted = true;
     },
@@ -120,7 +131,6 @@ export async function POST(req: NextRequest) {
     headers: {
       "Content-Type": "application/x-ndjson; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
-      // Evita que nginx/proxies acumulen la respuesta antes de enviarla
       "X-Accel-Buffering": "no",
     },
   });

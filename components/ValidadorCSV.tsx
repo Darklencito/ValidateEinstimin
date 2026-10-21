@@ -1,17 +1,20 @@
 "use client";
 
-import { DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
-  AlertCircle, ArrowRight, CheckCircle2, ChevronDown, ChevronUp, Clock, Copy,
-  Download, FileCheck2, FileSpreadsheet, FileUp, FolderClock, History, Info,
+  AlertCircle, ArrowRight, CheckCircle2, ChevronDown, ChevronUp, Clock, Cloud, Copy,
+  Download, FileCheck2, FileSpreadsheet, FileUp, FolderClock, History, Info, Languages,
   Loader2, Play, RefreshCw, RotateCcw, Search, ShieldAlert, Sparkles, Terminal,
   Trash2, Wand2, Wifi, XCircle,
 } from "lucide-react";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { downloadCsv, parseCsvText, toCsv, type Row } from "@/lib/csv";
+import {
+  downloadCsv, isExcelFileName, isSupportedSpreadsheetName, parseSpreadsheetBuffer, toCsv,
+  type EncodingReport, type Row,
+} from "@/lib/csv";
 import {
   ALL_STATUSES, STATUS_LABEL, emptySummary,
   type EaBatchResponse, type EmailResult, type EmailStatus, type ExtProviderInfo,
@@ -51,7 +54,7 @@ function detectEmailColumn(columns: string[], rows: Row[]): string {
 }
 
 /**
- * Detecta si el CSV subido ya es un archivo de resultados exportado por este validador
+ * Detecta si el archivo subido ya es un archivo de resultados exportado por este validador
  * (contiene columnas correo + estado + motivo, o estado_validacion).
  */
 function parseAlreadyProcessedCsv(columns: string[], rows: Row[]): ValidationResponse | null {
@@ -65,7 +68,6 @@ function parseAlreadyProcessedCsv(columns: string[], rows: Row[]): ValidationRes
 
   if (!colEmail || !colStatus) return null;
 
-  // Mapa inverso de etiqueta o clave a EmailStatus
   const labelToStatus = new Map<string, EmailStatus>();
   for (const st of ALL_STATUSES) {
     labelToStatus.set(st.toLowerCase(), st);
@@ -91,7 +93,6 @@ function parseAlreadyProcessedCsv(columns: string[], rows: Row[]): ValidationRes
     results.push({ email, status, reason, layer, confirmed, source });
   }
 
-  // Al menos el 60% de las filas deben tener un estado válido reconocido del sistema
   if (results.length === 0 || recognizedCount < results.length * 0.6) return null;
 
   const summary = emptySummary();
@@ -111,7 +112,7 @@ function parseAlreadyProcessedCsv(columns: string[], rows: Row[]): ValidationRes
  */
 function pickOnePerCell(results: EmailResult[], enabled: boolean): EmailResult[] {
   if (!enabled) return results;
-  const keeper = new Map<number, number>(); // grupo -> índice conservado
+  const keeper = new Map<number, number>();
   results.forEach((r, i) => {
     if (r.group === undefined) return;
     const cur = keeper.get(r.group);
@@ -161,11 +162,13 @@ export default function ValidadorCSV() {
   const [progress, setProgress] = useState<LiveProgress | null>(null);
   const [excludeFile, setExcludeFile] = useState<File | null>(null);
 
-  // Datos originales del CSV para poder exportar con todas las columnas o enviar al Constructor
+  // Datos originales del archivo y reporte de validación UTF-8 / Excel
   const [rawColumns, setRawColumns] = useState<string[]>([]);
   const [rawRows, setRawRows] = useState<Row[]>([]);
   const [emailColumn, setEmailColumn] = useState<string>("correo");
   const [keepOriginalCols, setKeepOriginalCols] = useState(true);
+  const [encodingReport, setEncodingReport] = useState<EncodingReport | null>(null);
+  const [wasExcelFile, setWasExcelFile] = useState(false);
 
   // Estado de detección de "CSV ya procesado"
   const [alreadyProcessedBanner, setAlreadyProcessedBanner] = useState<{
@@ -174,9 +177,10 @@ export default function ValidadorCSV() {
     fileName: string;
   } | null>(null);
 
-  // Historial de archivos procesados (IndexedDB)
+  // Historial de archivos procesados (Sincronizado con el servidor)
   const [historyList, setHistoryList] = useState<ProcessedFileRecord[]>([]);
   const [showHistory, setShowHistory] = useState(true);
+  const [syncingHistory, setSyncingHistory] = useState(false);
 
   // Consola de Logs al pie
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -201,6 +205,7 @@ export default function ValidadorCSV() {
 
   // Capa 4: verificación externa (EmailAwesome / emailval), opcional y con costo
   const [verifiers, setVerifiers] = useState<VerifiersStatus | null>(null);
+  const [refreshingCredits, setRefreshingCredits] = useState(false);
   const [extMode, setExtMode] = useState<string>("auto");
   const [eaMax, setEaMax] = useState(500);
 
@@ -208,34 +213,51 @@ export default function ValidadorCSV() {
     setLogs((prev) => [...prev, makeLog(level, step, message)]);
   };
 
-  // Auto-scroll de la consola de logs cuando llegan nuevos mensajes
   useEffect(() => {
     if (logsOpen && logContainerRef.current) {
       logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
     }
   }, [logs, logsOpen]);
 
-  // Cargar historial de archivos procesados al montar
-  const refreshHistory = async () => {
-    const items = await listProcessedFiles();
-    setHistoryList(items);
-  };
+  // Cargar historial de archivos procesados desde el servidor
+  const refreshHistory = useCallback(async () => {
+    setSyncingHistory(true);
+    try {
+      const items = await listProcessedFiles();
+      setHistoryList(items);
+    } finally {
+      setSyncingHistory(false);
+    }
+  }, []);
 
-  const refreshEa = () =>
-    fetch("/api/ea-status")
-      .then((r) => r.json())
-      .then((j: VerifiersStatus) => setVerifiers(j))
-      .catch(() => setVerifiers({ order: [], providers: [] }));
+  /** Consulta en tiempo real (sin caché) los proveedores y el saldo de EmailAwesome. */
+  const refreshEa = useCallback(async () => {
+    setRefreshingCredits(true);
+    try {
+      const r = await fetch(`/api/ea-status?t=${Date.now()}`, { cache: "no-store" });
+      const j: VerifiersStatus = await r.json();
+      setVerifiers(j);
+      window.dispatchEvent(new Event("credits:refresh"));
+    } catch {
+      setVerifiers({ order: [], providers: [] });
+    } finally {
+      setRefreshingCredits(false);
+    }
+  }, []);
 
   useEffect(() => {
     refreshEa();
     refreshHistory();
     setLogs([
-      makeLog("info", "Sistema", "Validador listo. Sube un archivo CSV o selecciona uno de tu historial de archivos procesados."),
+      makeLog(
+        "info",
+        "Sistema",
+        "Validador listo. Soporta CSV (con verificación y reparación automática UTF-8 / tildes) y archivos Excel (.xls, .xlsx)."
+      ),
     ]);
-  }, []);
+  }, [refreshEa, refreshHistory]);
 
-  // Auto-guardar en IndexedDB cada vez que cambian `data` o `logs` de un archivo activo
+  // Auto-guardar en el servidor cada vez que cambian `data` o `logs` de un archivo activo
   useEffect(() => {
     if (!data || !currentRecordId || !fileName) return;
     const timer = setTimeout(async () => {
@@ -251,17 +273,17 @@ export default function ValidadorCSV() {
         rawColumns,
         rawRows,
         emailColumn,
+        encodingSummary: encodingReport?.summary,
         logs,
       };
       await saveProcessedFile(record);
       await cacheEmailResults(data.results);
       await refreshHistory();
-    }, 350);
+    }, 400);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data, logs, currentRecordId]);
 
-  // Proveedores que se usarían según el modo elegido, en orden
   const extProviders = useMemo<ExtProviderInfo[]>(() => {
     if (!verifiers) return [];
     const configured = verifiers.providers.filter((p) => p.configured);
@@ -530,6 +552,9 @@ export default function ValidadorCSV() {
         if (batchDone > 0) {
           addLog("success", "Externa", `${p.name}: ${batchDone} correo(s) verificados en este lote (${pending.size} en espera).`);
         }
+        // Actualizar los créditos de EmailAwesome en tiempo real tras cada lote
+        refreshEa();
+
         if (recent.length > 40) recent.length = 40;
         if (res.fatal) {
           stopped = res.fatal;
@@ -612,8 +637,7 @@ export default function ValidadorCSV() {
       setError(msg);
       addLog("error", "Externa", msg);
     } finally {
-      refreshEa();
-      window.dispatchEvent(new Event("credits:refresh"));
+      await refreshEa();
       abortRef.current = null;
       setProgress(null);
       setLoading(false);
@@ -631,6 +655,18 @@ export default function ValidadorCSV() {
     setRawColumns(rec.rawColumns ?? []);
     setRawRows(rec.rawRows ?? []);
     setEmailColumn(rec.emailColumn || "correo");
+    setWasExcelFile(isExcelFileName(rec.fileName));
+    setEncodingReport(
+      rec.encodingSummary
+        ? {
+            detectedEncoding: "UTF-8",
+            convertedToUtf8: false,
+            repairedMojibake: 0,
+            replacementChars: 0,
+            summary: rec.encodingSummary,
+          }
+        : null
+    );
     setResultTab("all");
     setResultSearch("");
     if (bannerType) {
@@ -653,23 +689,36 @@ export default function ValidadorCSV() {
     ]);
   }
 
-  // ---------- Capas 1 y 2 (stream) + Detección de CSV ya procesado ----------
+  // ---------- Capas 1 y 2 (stream) + Validación UTF-8 + Soporte Excel (.xls/.xlsx) ----------
   async function handleFile(file: File, forceReprocess = false) {
     setError("");
     setAlreadyProcessedBanner(null);
-    if (!/\.csv$/i.test(file.name)) {
-      setError("El archivo debe tener extensión .csv");
-      addLog("error", "Archivo", `Archivo rechazado (${file.name}): no tiene extensión .csv`);
+    if (!isSupportedSpreadsheetName(file.name)) {
+      const msg = "El archivo debe ser .csv, .xls, .xlsx, .ods o .txt";
+      setError(msg);
+      addLog("error", "Archivo", `Archivo rechazado (${file.name}): ${msg}`);
       return;
     }
 
     lastFileRef.current = file;
-    const text = await file.text();
-    const hash = await computeCsvHash(text);
-    const parsed = parseCsvText(text);
+    const buffer = await file.arrayBuffer();
+    const parsed = parseSpreadsheetBuffer(buffer, file.name);
+    setEncodingReport(parsed.encoding);
+    setWasExcelFile(parsed.isExcel);
+
+    if (parsed.columns.length === 0 || parsed.rows.length === 0) {
+      const msg = parsed.errors[0] || "El archivo está vacío o no tiene fila de cabecera";
+      setError(msg);
+      addLog("error", "Archivo", msg);
+      return;
+    }
+
+    // Calculamos el hash sobre el CSV normalizado en UTF-8 (funciona igual para .xls, .xlsx y .csv)
+    const canonicalCsv = toCsv(parsed.rows, parsed.columns);
+    const hash = await computeCsvHash(canonicalCsv);
     const detectedCol = detectEmailColumn(parsed.columns, parsed.rows);
 
-    // 1. ¿Ya fue procesado exactamente este CSV antes? (mismo hash SHA-256)
+    // 1. ¿Ya fue procesado exactamente este archivo antes (en el servidor o localmente)?
     if (!forceReprocess) {
       const existing = await findProcessedByHash(hash);
       if (existing) {
@@ -677,16 +726,17 @@ export default function ValidadorCSV() {
         addLog(
           "warn",
           "Archivo",
-          `¡CSV detectado como ya procesado! «${file.name}» coincide exactamente con el procesado el ${new Date(existing.updatedAt).toLocaleString("es")}. Se cargaron los resultados instantáneamente.`
+          `¡Archivo detectado como ya procesado! «${file.name}» coincide exactamente con el procesado el ${new Date(existing.updatedAt).toLocaleString("es")}. Se cargaron los resultados instantáneamente.`
         );
         return;
       }
 
-      // 2. ¿Es un CSV que ya trae las columnas de resultados del validador (correo, estado, motivo...)?
+      // 2. ¿Es un CSV/Excel que ya trae las columnas de resultados del validador (correo, estado, motivo...)?
       const imported = parseAlreadyProcessedCsv(parsed.columns, parsed.rows);
       if (imported) {
         const recId = `rec_${hash.slice(0, 16)}`;
         const initialLogs: LogEntry[] = [
+          makeLog("info", "UTF-8", parsed.encoding.summary),
           makeLog(
             "success",
             "Archivo",
@@ -730,6 +780,11 @@ export default function ValidadorCSV() {
         "Archivo",
         `Cargado «${file.name}» (${(file.size / 1024).toFixed(1)} KB · ${parsed.rows.length.toLocaleString()} filas · columna de correo detectada: «${detectedCol}»).`
       ),
+      makeLog(
+        parsed.encoding.replacementChars > 0 ? "warn" : "success",
+        "UTF-8",
+        parsed.encoding.summary
+      ),
     ];
     if (excludeFile) {
       startLogs.push(makeLog("info", "Archivo", `Lista de exclusión adjunta: «${excludeFile.name}».`));
@@ -746,8 +801,12 @@ export default function ValidadorCSV() {
 
     const t0 = Date.now();
     try {
+      // Enviamos al backend el CSV ya normalizado en UTF-8 para garantizar rapidez y tildes limpias
+      const utf8File = new File([canonicalCsv], file.name.replace(/\.(xlsx?|xlsb|ods)$/i, ".csv"), {
+        type: "text/csv;charset=utf-8",
+      });
       const fd = new FormData();
-      fd.append("file", file);
+      fd.append("file", utf8File);
       if (excludeFile) fd.append("exclude", excludeFile);
       const res = await fetch("/api/validate-csv", { method: "POST", body: fd, signal: controller.signal });
       if (res.status === 401) {
@@ -766,7 +825,7 @@ export default function ValidadorCSV() {
       const layerCounts: [number, number, number, number] = [0, 0, 0, 0];
       let total = 0, done = 0, valid = 0, invalid = 0, risky = 0;
       let meta: StreamMeta | null = null;
-      let buffer = "";
+      let bufferStream = "";
       let lastFlush = 0;
 
       const flush = (force = false) => {
@@ -801,18 +860,18 @@ export default function ValidadorCSV() {
       for (;;) {
         const { value, done: streamDone } = await reader.read();
         if (streamDone) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
+        bufferStream += decoder.decode(value, { stream: true });
+        const lines = bufferStream.split("\n");
+        bufferStream = lines.pop() ?? "";
         for (const line of lines) if (line.trim()) handle(JSON.parse(line));
       }
-      if (buffer.trim()) handle(JSON.parse(buffer));
+      if (bufferStream.trim()) handle(JSON.parse(bufferStream));
       flush(true);
 
       if (!meta) throw new Error("La conexión se interrumpió antes de terminar. Inténtalo de nuevo.");
       let results = all.filter(Boolean);
 
-      // Cruzar con la caché local de correos ya confirmados en ejecuciones anteriores (Capa 3 / Capa 4)
+      // Cruzar con la caché de correos ya confirmados en ejecuciones anteriores (servidor + local)
       let cacheHits = 0;
       if (!forceReprocess) {
         const cachedMap = await getCachedEmails(results.map((r) => r.email));
@@ -949,7 +1008,6 @@ export default function ValidadorCSV() {
     };
   }, [data, onePerCell]);
 
-  // Filtrado de la tabla de resultados por pestaña + búsqueda
   const filteredResults = useMemo(() => {
     const q = resultSearch.trim().toLowerCase();
     return view.results.filter((r) => {
@@ -978,7 +1036,7 @@ export default function ValidadorCSV() {
     colMail = emailColumn,
     preserveAllCols = keepOriginalCols
   ): { columns: string[]; rows: Row[] } {
-    const validSet = new Map<string, string>(); // correo_lower o celda_lower -> correo limpio
+    const validSet = new Map<string, string>();
     for (const r of sourceResults) {
       if (r.status === "valid" && (!strictSmtp || r.confirmed)) {
         validSet.set(r.email.toLowerCase(), r.email);
@@ -992,7 +1050,6 @@ export default function ValidadorCSV() {
       for (const r of rows) {
         const rawCell = (r[colMail] ?? "").trim();
         if (!rawCell) continue;
-        // Buscar coincidencia directa o por partes
         let cleanEmail = validSet.get(rawCell.toLowerCase());
         if (!cleanEmail) {
           const parts = rawCell.split(/[\s/;,|]+/).filter(Boolean);
@@ -1022,10 +1079,18 @@ export default function ValidadorCSV() {
 
   function downloadClean() {
     const { columns: cols, rows } = buildCleanData();
-    const baseName = fileName ? fileName.replace(/\.csv$/i, "") : "correos";
+    const baseName = fileName ? fileName.replace(/\.(csv|xlsx?|xlsb|ods|txt)$/i, "") : "correos";
     const outName = `${baseName}_validos.csv`;
     downloadCsv(outName, toCsv(rows, cols));
-    addLog("success", "Exportación", `Descargado «${outName}» con ${rows.length.toLocaleString()} filas válidas (${cols.length} columnas).`);
+    addLog("success", "Exportación", `Descargado «${outName}» en UTF-8 con BOM (${rows.length.toLocaleString()} filas válidas, tildes preservadas).`);
+  }
+
+  function downloadOriginalAsUtf8Csv() {
+    if (rawColumns.length === 0 || rawRows.length === 0) return;
+    const baseName = fileName ? fileName.replace(/\.(csv|xlsx?|xlsb|ods|txt)$/i, "") : "archivo";
+    const outName = `${baseName}_utf8.csv`;
+    downloadCsv(outName, toCsv(rawRows, rawColumns));
+    addLog("success", "Exportación", `Convertido y descargado «${outName}» en CSV UTF-8 con todas sus tildes (${rawRows.length.toLocaleString()} filas).`);
   }
 
   function downloadFull() {
@@ -1037,7 +1102,7 @@ export default function ValidadorCSV() {
       confirmado_smtp: r.confirmed ? "si" : "no",
       celda_original: r.source ?? "",
     }));
-    const baseName = fileName ? fileName.replace(/\.csv$/i, "") : "resultado";
+    const baseName = fileName ? fileName.replace(/\.(csv|xlsx?|xlsb|ods|txt)$/i, "") : "resultado";
     const outName = `${baseName}_completo.csv`;
     downloadCsv(
       outName,
@@ -1056,7 +1121,7 @@ export default function ValidadorCSV() {
 
     const { columns: cols, rows } = buildCleanData(targetResults, targetCols, targetRows, targetMailCol, true);
     saveBuilderDraft({
-      fileName: targetName || "validados.csv",
+      fileName: (targetName || "validados.csv").replace(/\.(xlsx?|xlsb|ods)$/i, ".csv"),
       columns: cols,
       rows,
       fromValidator: true,
@@ -1077,7 +1142,7 @@ export default function ValidadorCSV() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `logs_${(fileName || "validador").replace(/\.csv$/i, "")}.log`;
+    a.download = `logs_${(fileName || "validador").replace(/\.(csv|xlsx?|xlsb|ods|txt)$/i, "")}.log`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -1097,37 +1162,53 @@ export default function ValidadorCSV() {
 
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold">Validador de correos</h1>
+          <h1 className="text-2xl font-semibold">Validador de correos (CSV y Excel .xls / .xlsx)</h1>
           <p className="text-sm text-slate-500">
-            Sube un CSV con tus contactos. Detecta automáticamente si el archivo ya fue procesado, conserva tus
-            columnas originales y guarda todo en tu historial local.
+            Sube un CSV o un archivo Excel (<code>.xls</code> / <code>.xlsx</code>). Valida y repara la codificación UTF-8
+            para mantener todas las tildes y guarda tus archivos en el servidor para que los veas desde cualquier lugar.
           </p>
         </div>
-        {historyList.length > 0 && (
+        <div className="flex items-center gap-2">
           <Button
             variant="secondary"
-            onClick={() => setShowHistory((v) => !v)}
-            className="shrink-0"
+            onClick={refreshHistory}
+            disabled={syncingHistory}
+            title="Sincronizar archivos guardados en el servidor"
           >
-            <FolderClock size={16} className="text-indigo-600" />
-            Archivos procesados ({historyList.length})
-            {showHistory ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+            <RefreshCw size={15} className={syncingHistory ? "animate-spin text-indigo-600" : "text-slate-600"} />
+            Sincronizar
           </Button>
-        )}
+          {historyList.length > 0 && (
+            <Button
+              variant="secondary"
+              onClick={() => setShowHistory((v) => !v)}
+              className="shrink-0"
+            >
+              <FolderClock size={16} className="text-indigo-600" />
+              Archivos guardados ({historyList.length})
+              {showHistory ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+            </Button>
+          )}
+        </div>
       </div>
 
-      {/* BANDEJA DE ARCHIVOS PROCESADOS */}
+      {/* BANDEJA DE ARCHIVOS PROCESADOS (GUARDADOS EN EL SERVIDOR) */}
       {historyList.length > 0 && showHistory && (
         <Card className="space-y-3 border-indigo-100 bg-gradient-to-br from-white to-indigo-50/30">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-100 text-indigo-700">
                 <History size={17} />
               </span>
               <div>
-                <h2 className="text-sm font-semibold text-slate-800">Bandeja de archivos procesados</h2>
+                <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-800">
+                  Bandeja de archivos procesados
+                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-800">
+                    <Cloud size={11} /> Guardados en el servidor
+                  </span>
+                </h2>
                 <p className="text-xs text-slate-500">
-                  Tus validaciones se guardan automáticamente aquí. Haz clic en cualquiera para reabrirla o enviarla a Brevo.
+                  Tus archivos están respaldados en el servidor: aunque entres desde otra computadora o navegador, siempre aparecerán aquí.
                 </p>
               </div>
             </div>
@@ -1180,7 +1261,6 @@ export default function ValidadorCSV() {
                       {rec.data.total.toLocaleString()} correos
                     </p>
 
-                    {/* Barra de proporción Válidos / Riesgo / Inválidos */}
                     <div className="mt-2.5 flex h-2 w-full overflow-hidden rounded-full bg-slate-100">
                       <div
                         className="bg-emerald-500"
@@ -1232,7 +1312,7 @@ export default function ValidadorCSV() {
                         onClick={async () => {
                           await deleteProcessedFile(rec.id);
                           await refreshHistory();
-                          addLog("info", "Historial", `Eliminado del historial: «${rec.fileName}».`);
+                          addLog("info", "Historial", `Eliminado del servidor: «${rec.fileName}».`);
                         }}
                         title="Eliminar del historial"
                         className="rounded-lg p-1 text-slate-400 hover:bg-red-50 hover:text-red-600"
@@ -1248,7 +1328,7 @@ export default function ValidadorCSV() {
         </Card>
       )}
 
-      {/* BANNER: ESTE CSV YA SE PROCESÓ */}
+      {/* BANNER: ESTE ARCHIVO YA SE PROCESÓ */}
       {alreadyProcessedBanner && (
         <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-emerald-300 bg-emerald-50/90 p-4 text-sm text-emerald-950 shadow-sm">
           <div className="flex items-start gap-3">
@@ -1257,7 +1337,7 @@ export default function ValidadorCSV() {
             </span>
             <div>
               <p className="font-semibold text-emerald-900">
-                ¡Este archivo CSV ya se procesó anteriormente!
+                ¡Este archivo ya se procesó anteriormente!
               </p>
               <p className="text-emerald-800">
                 {alreadyProcessedBanner.type === "hash_match" ? (
@@ -1288,12 +1368,39 @@ export default function ValidadorCSV() {
         </div>
       )}
 
+      {/* BANNER DE VALIDACIÓN UTF-8 Y CONVERSIÓN EXCEL -> CSV */}
+      {encodingReport && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-indigo-200 bg-indigo-50/70 px-4 py-3 text-xs text-indigo-950">
+          <div className="flex items-center gap-2.5">
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-indigo-600 text-white">
+              <Languages size={15} />
+            </span>
+            <div>
+              <p className="font-semibold text-indigo-900">
+                Validación de textos UTF-8 y tildes: {encodingReport.detectedEncoding}
+              </p>
+              <p className="text-indigo-800">{encodingReport.summary}</p>
+            </div>
+          </div>
+          {(wasExcelFile || encodingReport.convertedToUtf8 || encodingReport.repairedMojibake > 0) &&
+            rawRows.length > 0 && (
+              <Button
+                variant="secondary"
+                onClick={downloadOriginalAsUtf8Csv}
+                className="border-indigo-300 bg-white text-xs text-indigo-800 hover:bg-indigo-100"
+              >
+                <Download size={14} /> Descargar todo convertido a CSV (UTF-8 con tildes)
+              </Button>
+            )}
+        </div>
+      )}
+
       <Card className="space-y-4">
         {/* Lista de exclusión */}
         <div className="rounded-lg border border-slate-200 p-3 text-sm">
           <p className="font-medium">Lista de exclusión (opcional, recomendado para Brevo)</p>
           <p className="mb-2 text-slate-500">
-            Sube un CSV exportado de Brevo con tus contactos bloqueados, rebotados (hard bounce)
+            Sube un CSV o Excel exportado de Brevo con tus contactos bloqueados, rebotados (hard bounce)
             o dados de baja. Esos correos se descartarán. Selecciónalo <strong>antes</strong> de
             subir tu archivo principal.
           </p>
@@ -1321,7 +1428,7 @@ export default function ValidadorCSV() {
             <input
               ref={excludeRef}
               type="file"
-              accept=".csv,.txt,text/csv"
+              accept=".csv,.txt,.xls,.xlsx,.ods,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
               hidden
               onChange={(e) => {
                 setExcludeFile(e.target.files?.[0] ?? null);
@@ -1348,16 +1455,18 @@ export default function ValidadorCSV() {
           ) : (
             <>
               <FileUp className="text-indigo-600" size={36} />
-              <p className="text-sm font-medium">Arrastra tu CSV aquí o haz clic para seleccionarlo</p>
+              <p className="text-sm font-medium">
+                Arrastra tu archivo CSV o Excel (<code>.xls</code> / <code>.xlsx</code>) aquí o haz clic para seleccionarlo
+              </p>
               <p className="text-xs text-slate-500">
-                Máx. 5 MB · 10.000 correos · Si el CSV ya fue procesado antes, lo detectaremos al instante
+                Máx. 10 MB · 10.000 correos · Valida textos UTF-8 y mantiene todas las tildes y ñ automáticamente
               </p>
             </>
           )}
           <input
             ref={inputRef}
             type="file"
-            accept=".csv,text/csv"
+            accept=".csv,.xls,.xlsx,.ods,.txt,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             hidden
             onChange={(e) => {
               const f = e.target.files?.[0];
@@ -1556,20 +1665,32 @@ export default function ValidadorCSV() {
           {/* Capa 4: verificación externa */}
           {view.unconfirmed > 0 && (
             <Card className="space-y-3 border-slate-200 text-sm">
-              <div>
-                <p className="font-medium">Paso 3 · Capa 4: verificación externa (opcional)</p>
-                <p className="text-slate-500">
-                  Hay <strong>{view.unconfirmed.toLocaleString()}</strong> correos válidos que ningún servidor confirmó
-                  (no concluyentes o sin SMTP). Un proveedor externo puede confirmarlos, pero <strong>tiene costo</strong>.
-                  Nunca se envía nada sin que lo confirmes.
-                </p>
-                {view.pending > 0 && (
-                  <p className="mt-2 rounded-lg bg-green-50 p-2 text-green-800">
-                    Todavía no usaste la capa 3 (gratis) en <strong>{view.pending.toLocaleString()}</strong> correos.
-                    Hazla primero: así gastas menos créditos.
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="flex-1">
+                  <p className="font-medium">Paso 3 · Capa 4: verificación externa (opcional)</p>
+                  <p className="text-slate-500">
+                    Hay <strong>{view.unconfirmed.toLocaleString()}</strong> correos válidos que ningún servidor confirmó
+                    (no concluyentes o sin SMTP). Un proveedor externo puede confirmarlos, pero <strong>tiene costo</strong>.
+                    Nunca se envía nada sin que lo confirmes.
                   </p>
-                )}
+                </div>
+                <Button
+                  variant="secondary"
+                  onClick={refreshEa}
+                  disabled={refreshingCredits || loading}
+                  className="text-xs"
+                >
+                  <RefreshCw size={14} className={refreshingCredits ? "animate-spin" : ""} />
+                  Actualizar créditos
+                </Button>
               </div>
+
+              {view.pending > 0 && (
+                <p className="rounded-lg bg-green-50 p-2 text-green-800">
+                  Todavía no usaste la capa 3 (gratis) en <strong>{view.pending.toLocaleString()}</strong> correos.
+                  Hazla primero: así gastas menos créditos.
+                </p>
+              )}
 
               {verifiers && verifiers.providers.every((p) => !p.configured) ? (
                 <p className="rounded-lg bg-amber-50 p-2 text-amber-800">
@@ -1620,7 +1741,10 @@ export default function ValidadorCSV() {
                           {!p.configured && " (sin clave configurada)"}
                           {p.balance !== null && (
                             <>
-                              {" "}· créditos: <strong className={p.balance <= 0 ? "text-red-600" : ""}>{p.balance.toLocaleString()}</strong>
+                              {" "}· créditos disponibles en vivo:{" "}
+                              <strong className={p.balance <= 0 ? "text-red-600" : "text-emerald-700"}>
+                                {p.balance.toLocaleString()}
+                              </strong>
                             </>
                           )}
                           {p.costPerEmail !== null && (
@@ -1694,9 +1818,9 @@ export default function ValidadorCSV() {
                       className="mt-0.5"
                     />
                     <span>
-                      <strong>Conservar todas las columnas originales del CSV ({rawColumns.join(", ")})</strong>
+                      <strong>Conservar todas las columnas originales ({rawColumns.join(", ")})</strong>
                       <span className="block text-xs text-slate-500">
-                        Ideal para Brevo: mantiene nombre, teléfono, ciudad, etc. de cada contacto válido.
+                        Ideal para Brevo: mantiene nombre, teléfono, ciudad, etc. de cada contacto válido en UTF-8 con tildes.
                       </span>
                     </span>
                   </label>
@@ -1705,7 +1829,7 @@ export default function ValidadorCSV() {
 
               <div className="flex flex-wrap gap-2">
                 <Button onClick={downloadClean} disabled={cleanCount === 0}>
-                  <Download size={16} /> CSV limpio ({cleanCount.toLocaleString()})
+                  <Download size={16} /> CSV limpio UTF-8 ({cleanCount.toLocaleString()})
                 </Button>
                 <Button
                   variant="secondary"

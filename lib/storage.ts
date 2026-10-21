@@ -1,7 +1,7 @@
-// Almacenamiento en el navegador (IndexedDB + sessionStorage) para:
-// 1. Historial de archivos CSV procesados y su estado completo
-// 2. Huella SHA-256 de cada CSV para detectar si ya fue procesado
-// 3. Caché de correos ya verificados (especialmente SMTP y Capa 4 con costo)
+// Almacenamiento híbrido (Servidor en /api/history + respaldo local en IndexedDB) para:
+// 1. Historial de archivos CSV / Excel procesados compartido entre todos los dispositivos/navegadores
+// 2. Huella SHA-256 de cada archivo para detectar si ya fue procesado desde cualquier lugar
+// 3. Caché global de correos ya verificados (especialmente SMTP y Capa 4 con costo)
 // 4. Envío directo de datos limpios del Validador al Constructor
 
 import type { Row } from "./csv";
@@ -13,7 +13,7 @@ export interface LogEntry {
   id: string;
   time: string; // HH:mm:ss
   level: LogLevel;
-  step: string; // "Archivo" | "Capa 1-2" | "SMTP" | "Externa" | "Exportación" | "Sistema"
+  step: string;
   message: string;
 }
 
@@ -28,6 +28,7 @@ export interface ProcessedFileRecord {
   rawColumns: string[];
   rawRows: Row[];
   emailColumn: string;
+  encodingSummary?: string;
   logs: LogEntry[];
 }
 
@@ -66,7 +67,7 @@ function openDb(): Promise<IDBDatabase> {
   });
 }
 
-/** Calcula el hash SHA-256 del contenido normalizado del CSV. */
+/** Calcula el hash SHA-256 del contenido normalizado del CSV o de las filas parseadas. */
 export async function computeCsvHash(text: string): Promise<string> {
   const normalized = text.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").trim();
   if (typeof crypto !== "undefined" && crypto.subtle) {
@@ -76,7 +77,6 @@ export async function computeCsvHash(text: string): Promise<string> {
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
   }
-  // Fallback simple si crypto.subtle no está disponible (ej. HTTP sin localhost)
   let h = 2166136261;
   for (let i = 0; i < normalized.length; i++) {
     h ^= normalized.charCodeAt(i);
@@ -102,8 +102,7 @@ export function makeLog(
   };
 }
 
-/** Lista todos los archivos procesados ordenados del más reciente al más antiguo. */
-export async function listProcessedFiles(): Promise<ProcessedFileRecord[]> {
+async function listLocalProcessedFiles(): Promise<ProcessedFileRecord[]> {
   try {
     const db = await openDb();
     return await new Promise((resolve, reject) => {
@@ -121,10 +120,52 @@ export async function listProcessedFiles(): Promise<ProcessedFileRecord[]> {
   }
 }
 
-/** Busca si un archivo con el mismo hash ya fue procesado antes. */
+/**
+ * Lista todos los archivos procesados desde el servidor (y sincroniza cualquier archivo local
+ * previo de IndexedDB para que esté disponible desde cualquier dispositivo).
+ */
+export async function listProcessedFiles(): Promise<ProcessedFileRecord[]> {
+  const localItems = await listLocalProcessedFiles();
+  try {
+    if (localItems.length > 0) {
+      const res = await fetch("/api/history", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "sync_local", files: localItems }),
+        cache: "no-store",
+      });
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json.files)) return json.files;
+      }
+    } else {
+      const res = await fetch("/api/history", { cache: "no-store" });
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json.files)) return json.files;
+      }
+    }
+  } catch {
+    // Fallback a local si no hay red temporalmente
+  }
+  return localItems;
+}
+
+/** Busca si un archivo con el mismo hash ya fue procesado antes (en el servidor o localmente). */
 export async function findProcessedByHash(
   fileHash: string
 ): Promise<ProcessedFileRecord | null> {
+  try {
+    const res = await fetch(`/api/history?hash=${encodeURIComponent(fileHash)}`, {
+      cache: "no-store",
+    });
+    if (res.ok) {
+      const json = await res.json();
+      if (json.match) return json.match as ProcessedFileRecord;
+    }
+  } catch {
+    // ignore
+  }
   try {
     const db = await openDb();
     return await new Promise((resolve, reject) => {
@@ -143,10 +184,22 @@ export async function findProcessedByHash(
   }
 }
 
-/** Guarda o actualiza un archivo procesado en el historial (conserva máximo 25). */
+/** Guarda o actualiza un archivo procesado en el servidor y en el respaldo local. */
 export async function saveProcessedFile(
   record: ProcessedFileRecord
 ): Promise<void> {
+  // 1. Guardar en el servidor para que sea accesible desde cualquier computadora/navegador
+  try {
+    await fetch("/api/history", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "save_file", record }),
+    });
+  } catch {
+    // ignore
+  }
+
+  // 2. Guardar también en IndexedDB local como respaldo rápido
   try {
     const db = await openDb();
     await new Promise<void>((resolve, reject) => {
@@ -155,21 +208,18 @@ export async function saveProcessedFile(
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-    // Limpiar antiguos si hay más de 25
-    const all = await listProcessedFiles();
-    if (all.length > 25) {
-      const toDelete = all.slice(25);
-      for (const old of toDelete) {
-        await deleteProcessedFile(old.id);
-      }
-    }
   } catch {
-    // Ignorar errores de cuota
+    // ignore
   }
 }
 
-/** Elimina un archivo procesado del historial. */
+/** Elimina un archivo procesado del servidor y del respaldo local. */
 export async function deleteProcessedFile(id: string): Promise<void> {
+  try {
+    await fetch(`/api/history?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+  } catch {
+    // ignore
+  }
   try {
     const db = await openDb();
     await new Promise<void>((resolve, reject) => {
@@ -183,26 +233,36 @@ export async function deleteProcessedFile(id: string): Promise<void> {
   }
 }
 
-/** Guarda resultados de correos (especialmente capa 3 y 4) en la caché global local. */
+/** Guarda resultados de correos (especialmente capa 3 y 4) en la caché del servidor y local. */
 export async function cacheEmailResults(results: EmailResult[]): Promise<void> {
+  const worthy = results.filter((r) => (r.layer && r.layer >= 3) || r.confirmed);
+  if (worthy.length === 0) return;
+
+  try {
+    await fetch("/api/history", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "cache_emails", results: worthy }),
+    });
+  } catch {
+    // ignore
+  }
+
   try {
     const db = await openDb();
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_EMAIL_CACHE, "readwrite");
       const store = tx.objectStore(STORE_EMAIL_CACHE);
       const now = Date.now();
-      for (const r of results) {
-        // Guardamos sobre todo los que llegaron a capa 3 o 4, o fueron confirmados
-        if ((r.layer && r.layer >= 3) || r.confirmed) {
-          store.put({
-            email: r.email.toLowerCase(),
-            status: r.status,
-            reason: r.reason,
-            layer: r.layer,
-            confirmed: r.confirmed,
-            updatedAt: now,
-          });
-        }
+      for (const r of worthy) {
+        store.put({
+          email: r.email.toLowerCase(),
+          status: r.status,
+          reason: r.reason,
+          layer: r.layer,
+          confirmed: r.confirmed,
+          updatedAt: now,
+        });
       }
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
@@ -212,23 +272,46 @@ export async function cacheEmailResults(results: EmailResult[]): Promise<void> {
   }
 }
 
-/** Consulta resultados cacheados previamente (capa 3 o 4) para no gastar créditos ni SMTP dos veces. */
+/** Consulta resultados cacheados previamente (en el servidor y localmente). */
 export async function getCachedEmails(
   emails: string[]
 ): Promise<Map<string, Pick<EmailResult, "status" | "reason" | "layer" | "confirmed">>> {
   const map = new Map<string, Pick<EmailResult, "status" | "reason" | "layer" | "confirmed">>();
+  if (emails.length === 0) return map;
+
+  // 1. Consultar caché del servidor
+  try {
+    const res = await fetch("/api/history", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "get_cached_emails", emails }),
+      cache: "no-store",
+    });
+    if (res.ok) {
+      const json = await res.json();
+      if (json.cached && typeof json.cached === "object") {
+        for (const [k, v] of Object.entries(json.cached)) {
+          const item = v as Pick<EmailResult, "status" | "reason" | "layer" | "confirmed">;
+          map.set(k, item);
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // 2. Complementar con IndexedDB local
   try {
     const db = await openDb();
     await new Promise<void>((resolve) => {
       const tx = db.transaction(STORE_EMAIL_CACHE, "readonly");
       const store = tx.objectStore(STORE_EMAIL_CACHE);
       let remaining = emails.length;
-      if (remaining === 0) return resolve();
       for (const raw of emails) {
         const key = raw.toLowerCase();
         const req = store.get(key);
         req.onsuccess = () => {
-          if (req.result) {
+          if (req.result && !map.has(key)) {
             map.set(key, {
               status: req.result.status,
               reason: req.result.reason,

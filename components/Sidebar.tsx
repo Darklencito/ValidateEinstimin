@@ -24,7 +24,7 @@ function CreditsCard() {
   const load = useCallback(async () => {
     setRefreshing(true);
     try {
-      const res = await fetch("/api/ea-status", { cache: "no-store" });
+      const res = await fetch(`/api/ea-status?t=${Date.now()}`, { cache: "no-store" });
       if (!res.ok) throw new Error();
       setStatus(await res.json());
       setFailed(false);

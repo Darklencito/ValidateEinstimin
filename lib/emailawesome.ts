@@ -25,8 +25,10 @@ class EaError extends Error {
 async function ea(url: string, init: RequestInit = {}) {
   const res = await fetch(url, {
     ...init,
+    cache: "no-store",
     headers: {
       Accept: "application/json",
+      "Cache-Control": "no-cache",
       "x-api-key": apiKey(),
       ...(init.body ? { "Content-Type": "application/json" } : {}),
     },
@@ -42,13 +44,21 @@ async function ea(url: string, init: RequestInit = {}) {
 }
 
 /**
- * Saldo de créditos (GET /billing/me -> {balance}). Devuelve null si no se pudo obtener:
- * es solo informativo y nunca debe bloquear el resto de la app.
+ * Saldo de créditos actualizado en tiempo real (GET /billing/me -> {balance, top_up:{purchased_balance}}).
+ * Devuelve null si no se pudo obtener.
  */
 export async function getBalance(): Promise<number | null> {
   try {
-    const j = (await ea(`${root()}/billing/me`)) as { balance?: unknown };
-    return typeof j.balance === "number" && Number.isFinite(j.balance) ? j.balance : null;
+    const j = (await ea(`${root()}/billing/me?t=${Date.now()}`)) as {
+      balance?: unknown;
+      top_up?: { purchased_balance?: unknown };
+    };
+    const planBal = typeof j.balance === "number" && Number.isFinite(j.balance) ? j.balance : null;
+    const topUpBal =
+      typeof j.top_up?.purchased_balance === "number" && Number.isFinite(j.top_up.purchased_balance)
+        ? j.top_up.purchased_balance
+        : 0;
+    return planBal !== null ? planBal + topUpBal : null;
   } catch {
     return null;
   }
